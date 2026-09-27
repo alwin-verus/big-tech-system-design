@@ -14,6 +14,7 @@
 
 ## Table of contents
 
+- [Before you read: design it yourself](#before-you-read-design-it-yourself)
 - [The problem](#the-problem)
 - [Scale](#scale)
 - [Requirements](#requirements)
@@ -26,6 +27,82 @@
 - [Interview takeaways](#interview-takeaways)
 - [Glossary](#glossary)
 - [Sources](#sources)
+
+## Before you read: design it yourself
+
+Try each question for 5 minutes before reading the answer — the point is to feel where the hard part is, not to get it "right."
+
+### Q1. How do you rank millions of listings against a search query in a few hundred milliseconds, when "the right room" depends on soft signals no keyword filter can capture?
+
+<details>
+<summary>Hint</summary>
+
+Narrow candidates cheaply first, then spend expensive compute only on the survivors.
+
+</details>
+
+<details>
+<summary>How Airbnb does it</summary>
+
+Retrieval narrows millions of listings down via two parallel paths: a traditional keyword/geo index, and embedding-based retrieval (EBR) — a two-tower neural net mapping the query and each listing into the same vector space. Airbnb picked an IVF index over the more common HNSW specifically because IVF tolerates Airbnb's high rate of real-time listing updates better. The merged candidates then go through a two-stage ranking pipeline: a gradient-boosted tree model first, then a deep neural net, with explicit corrections for positional bias and cold start. Trade-off: two retrieval systems and two ranking models both have to be trained, monitored, and kept from drifting apart, plus ongoing tuning to keep re-correcting for positional bias as ranking itself changes what guests click.
+
+Deep dive: [Search & ranking](#search--ranking)
+
+</details>
+
+### Q2. How do you guarantee a scarce resource — one specific night, on one specific listing — is never sold twice, when the system that shows availability (search) is allowed to be seconds out of date?
+
+<details>
+<summary>Hint</summary>
+
+What's the one authoritative check that has to run before money moves?
+
+</details>
+
+<details>
+<summary>How Airbnb does it</summary>
+
+Search is allowed to be eventually consistent — a stale listing just gets "no longer available" — but the Booking Service's hold against the Calendar/Availability DB is the one authoritative check, and it runs before any payment attempt. The natural way to make double-booking structurally impossible, not just unlikely, is a uniqueness constraint on `(listing_id, night_date)`, with a short-TTL `held` state between `open` and `booked` so an abandoned checkout releases the nights automatically. Whichever hold request lands first wins; the second gets a conflict and never reaches payment — nobody gets charged for nights they didn't get. Trade-off: a strongly-consistent partition can't use the cheap, eventually-consistent scaling tricks (aggressive caching, async propagation) the rest of the system relies on.
+
+Deep dive: [Availability calendar](#availability-calendar)
+
+</details>
+
+### Q3. How do you move money for a booking across 191 countries and 70+ currencies — capture it from the guest and pay the host out days later — without ever double-charging or silently losing a dollar?
+
+<details>
+<summary>Hint</summary>
+
+What has to happen, durably, before you call an external system that might time out?
+
+</details>
+
+<details>
+<summary>How Airbnb does it</summary>
+
+Every payment call goes through Orpheus, Airbnb's idempotency framework: durably record the intent to charge before calling the external processor, call it, then record the outcome — a timeout is safely retried against the same recorded intent instead of risking a second charge. The payments platform is domain-decomposed into pay-in, payout, ledger, and settlement subdomains so country/processor teams can ship independently across 24+ processor integrations. Every movement is recorded as an immutable, double-entry ledger entry, never an in-place balance update, so history and FX adjustments are always reconstructable. Trade-off: domain decomposition means any consumer wanting one simple "did this get paid" answer now has to query multiple services and reconcile the result itself.
+
+Deep dive: [Booking & payments flow](#booking--payments-flow)
+
+</details>
+
+### Q4. What made a single Rails codebase — Monorail — that worked fine for years become the thing actively slowing the whole company down, and how do you split it without recreating the same coupling one network hop later?
+
+<details>
+<summary>Hint</summary>
+
+Splitting the code isn't the hard part — what else has to split alongside it?
+
+</details>
+
+<details>
+<summary>How Airbnb does it</summary>
+
+At around 200 engineers, Monorail measured roughly 15 hours/week of average blocked-deploy time from reverts and rollbacks in one shared deploy queue — a measured number, not a vibe, is what justified the migration. Airbnb split into a service-oriented architecture (SOA, deliberately not pure microservices) with one core rule: each service owns its own database, and everyone else goes through its API — splitting code without splitting who can write which tables just moves the tangle one network hop over. Changes propagate asynchronously via Kafka fed by change-data-capture (SpinalTap), so a spike in one domain's load can't slow down another. Trade-off: cross-domain reads that used to be one SQL join now need an API call or a cache, and hundreds of independently-deployed services is a lot more to monitor and version.
+
+Deep dive: [SOA migration from the Rails monolith](#soa-migration-from-the-rails-monolith)
+
+</details>
 
 ## The problem
 

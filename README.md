@@ -5,7 +5,9 @@
 ## Table of contents
 
 * [How to read this repo](#how-to-read-this-repo)
+* [Learning path](#learning-path)
 * [Companies](#companies)
+* [Comparisons](#comparisons)
 * [Common building blocks](#common-building-blocks)
 * [Engineering blogs](#engineering-blogs)
 * [Learning resources](#learning-resources)
@@ -17,6 +19,7 @@
 
 Each company page follows the same layout ([TEMPLATE.md](TEMPLATE.md)):
 
+1. **Before you read: design it yourself**: 4 questions to try first, with hidden hints and answers.
 1. **In 60 seconds**: the short-video version.
 2. **Scale**: real numbers, each one linked to a source.
 3. **High-level design (HLD)**: the big boxes: apps, gateways, services, queues, databases.
@@ -26,24 +29,55 @@ Each company page follows the same layout ([TEMPLATE.md](TEMPLATE.md)):
 
 Diagrams are written in [Mermaid](https://mermaid.js.org/), which GitHub draws automatically. Where a company hasn't published the details, the page says so and labels the diagram as a simplified reference design.
 
+Short on time? Every company also has a one-page **cheat sheet** (linked in the table below): the summary, one diagram, key numbers and a ready-made interview answer outline.
+
+<p align="right"><a href="#table-of-contents"><b>↥ Back to top</b></a></p>
+
+## Learning path
+
+New to system design? Read in this order. Each stage adds one big idea on top of the last, and ends with a comparison page that ties the stage together.
+
+| Stage | Big idea | Read | Then compare |
+|---|---|---|---|
+| 1. Storing lots of data | One database is not enough: caching, sharding, unique IDs | [Instagram](companies/instagram.md), [Twitter / X](companies/twitter-x.md) | [Databases and sharding](comparisons/databases-and-sharding.md), [Feeds and fan-out](comparisons/feeds-and-fan-out.md) |
+| 2. Real-time connections | Keeping millions of connections open and pushing messages instantly | [WhatsApp](companies/whatsapp.md), [Slack](companies/slack.md), [Discord](companies/discord.md) | [Real-time messaging](comparisons/real-time-messaging.md) |
+| 3. Big files and media | Moving huge files: chunking, encoding, CDNs | [Dropbox](companies/dropbox.md), [YouTube](companies/youtube.md), [Netflix](companies/netflix.md), [Spotify](companies/spotify.md) | [Media delivery](comparisons/media-delivery.md) |
+| 4. Marketplaces and location | Matching two sides of a market, searching by place | [Uber](companies/uber.md), [Airbnb](companies/airbnb.md) | [Monolith to microservices](comparisons/monolith-to-microservices.md) |
+| 5. Correctness and money | When a bug means someone gets charged twice | [Stripe](companies/stripe.md) | [Money and correctness](comparisons/money-and-correctness.md) |
+
 <p align="right"><a href="#table-of-contents"><b>↥ Back to top</b></a></p>
 
 ## Companies
 
-| Company | Problem it solves | Signature ideas |
-|---|---|---|
-| [Uber](companies/uber.md) | Match riders to nearby drivers in seconds | H3 hex geo-index, DISCO dispatch, Ringpop |
-| [Netflix](companies/netflix.md) | Stream video to hundreds of millions of screens | Open Connect CDN, microservices on AWS, per-title encoding |
-| [YouTube](companies/youtube.md) | Upload, transcode and serve video at planet scale | Transcode pipeline, Vitess, global edge caching |
-| [WhatsApp](companies/whatsapp.md) | Deliver billions of encrypted messages a day | Erlang, store-and-forward, Signal protocol |
-| [Discord](companies/discord.md) | Real-time chat and voice for huge communities | Elixir gateways, ScyllaDB, Rust data services |
-| [Slack](companies/slack.md) | Real-time workplace messaging | Channel/gateway servers, Vitess, Flannel edge cache |
-| [Instagram](companies/instagram.md) | Share photos and build a ranked feed | Django at scale, sharded Postgres IDs, Cassandra |
-| [Twitter / X](companies/twitter-x.md) | Build home timelines for hundreds of millions | Fan-out on write, Snowflake IDs, Manhattan |
-| [Spotify](companies/spotify.md) | Stream music and recommend what's next | Backstage, GCP event delivery, Discover Weekly |
-| [Airbnb](companies/airbnb.md) | Search, rank and book homes | Monolith to SOA, search ranking, availability calendar |
-| [Stripe](companies/stripe.md) | Move money through an API safely | Idempotency keys, DocDB, ledger, rate limiters |
-| [Dropbox](companies/dropbox.md) | Sync files across devices reliably | Magic Pocket, Nucleus sync engine, block dedupe |
+| Company | Problem it solves | Signature ideas | Cheat sheet |
+|---|---|---|---|
+| [Uber](companies/uber.md) | Match riders to nearby drivers in seconds | H3 hex geo-index, DISCO dispatch, Ringpop | [1 page](cheatsheets/uber.md) |
+| [Netflix](companies/netflix.md) | Stream video to hundreds of millions of screens | Open Connect CDN, microservices on AWS, per-title encoding | [1 page](cheatsheets/netflix.md) |
+| [YouTube](companies/youtube.md) | Upload, transcode and serve video at planet scale | Transcode pipeline, Vitess, global edge caching | [1 page](cheatsheets/youtube.md) |
+| [WhatsApp](companies/whatsapp.md) | Deliver billions of encrypted messages a day | Erlang, store-and-forward, Signal protocol | [1 page](cheatsheets/whatsapp.md) |
+| [Discord](companies/discord.md) | Real-time chat and voice for huge communities | Elixir gateways, ScyllaDB, Rust data services | [1 page](cheatsheets/discord.md) |
+| [Slack](companies/slack.md) | Real-time workplace messaging | Channel/gateway servers, Vitess, Flannel edge cache | [1 page](cheatsheets/slack.md) |
+| [Instagram](companies/instagram.md) | Share photos and build a ranked feed | Django at scale, sharded Postgres IDs, Cassandra | [1 page](cheatsheets/instagram.md) |
+| [Twitter / X](companies/twitter-x.md) | Build home timelines for hundreds of millions | Fan-out on write, Snowflake IDs, Manhattan | [1 page](cheatsheets/twitter-x.md) |
+| [Spotify](companies/spotify.md) | Stream music and recommend what's next | Backstage, GCP event delivery, Discover Weekly | [1 page](cheatsheets/spotify.md) |
+| [Airbnb](companies/airbnb.md) | Search, rank and book homes | Monolith to SOA, search ranking, availability calendar | [1 page](cheatsheets/airbnb.md) |
+| [Stripe](companies/stripe.md) | Move money through an API safely | Idempotency keys, DocDB, ledger, rate limiters | [1 page](cheatsheets/stripe.md) |
+| [Dropbox](companies/dropbox.md) | Sync files across devices reliably | Magic Pocket, Nucleus sync engine, block dedupe | [1 page](cheatsheets/dropbox.md) |
+
+<p align="right"><a href="#table-of-contents"><b>↥ Back to top</b></a></p>
+
+## Comparisons
+
+Same problem, different companies. These pages put the answers side by side, which is where the patterns become obvious.
+
+| Page | Compares |
+|---|---|
+| [Real-time messaging](comparisons/real-time-messaging.md) | WhatsApp, Discord, Slack |
+| [Feeds and fan-out](comparisons/feeds-and-fan-out.md) | Twitter / X, Instagram (Discord, Slack as contrast) |
+| [Media delivery](comparisons/media-delivery.md) | Netflix, YouTube, Spotify, Instagram |
+| [Databases and sharding](comparisons/databases-and-sharding.md) | Instagram, Slack, YouTube, Discord, Uber, Stripe, Dropbox, Twitter / X, Airbnb |
+| [Monolith to microservices](comparisons/monolith-to-microservices.md) | Airbnb, Twitter / X, Uber, Netflix, Instagram, Spotify |
+| [Money and correctness](comparisons/money-and-correctness.md) | Stripe, Airbnb, Uber |
 
 <p align="right"><a href="#table-of-contents"><b>↥ Back to top</b></a></p>
 

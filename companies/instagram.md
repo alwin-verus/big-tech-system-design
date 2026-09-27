@@ -6,6 +6,7 @@
 
 ## Table of contents
 
+- [Before you read: design it yourself](#before-you-read-design-it-yourself)
 - [The problem](#the-problem)
 - [Scale](#scale)
 - [Requirements](#requirements)
@@ -18,6 +19,74 @@
 - [Interview takeaways](#interview-takeaways)
 - [Glossary](#glossary)
 - [Sources](#sources)
+
+## Before you read: design it yourself
+
+Try each question for 5 minutes on your own before reading the "how" — that's the exercise, not a formality.
+
+### Q1. How do you generate unique IDs across thousands of independent database shards, with no shard ever needing to ask another shard (or a central service) for a number?
+
+<details><summary>Hint</summary>
+
+Consider encoding "which shard made this" directly into the ID itself, instead of looking it up afterward.
+
+</details>
+
+<details><summary>How Instagram does it</summary>
+
+A PL/pgSQL function (code that runs inside PostgreSQL itself) builds each 64-bit ID out of three parts: 41 bits of millisecond timestamp, 13 bits identifying the logical shard, and 10 bits from that shard's own local auto-incrementing sequence. Uniqueness comes from the shard-ID bits alone — shard 42 and shard 99 can hand out IDs at the exact same millisecond with zero risk of collision, because neither ever has to check in with the other. This is conceptually like Twitter's Snowflake, but built into Postgres instead of a whole separate ID service Instagram would have had to operate. Cost: a hard ceiling of 1,024 new rows per shard per millisecond.
+
+Deep dive: [The sharded ID scheme](#the-sharded-id-scheme-instagrams-alternative-to-snowflake)
+
+</details>
+
+### Q2. How do you rank an effectively infinite pool of candidate posts, for over a billion people, in real time, without one model trying to do everything?
+
+<details><summary>Hint</summary>
+
+Think about spending cheap compute on a huge pool first, then expensive compute on only what survives.
+
+</details>
+
+<details><summary>How Instagram does it</summary>
+
+Ranking runs as a funnel, not one model: a **Two-Tower** network (one half encodes the user, one half the candidate post, each side cacheable independently) handles retrieval and early ranking cheaply over billions of candidates, narrowing to roughly 100; a heavier multi-task model then scores that shortlist for click/like/"see less" and combines them into one expected-value score; a final pass applies integrity filters and diversity rules. Each stage's whole job is to make the next, more expensive stage's problem small enough to afford. By 2025 this pattern repeated across Feed, Stories, Reels, comments, and notifications as 1,000+ separate models.
+
+Deep dive: [Feed and Explore ranking](#feed-and-explore-ranking-from-one-sort-order-to-1000-models)
+
+</details>
+
+### Q3. Hundreds of engineers ship to the same codebase every day — how do you keep it shippable without splintering it into microservices?
+
+<details><summary>Hint</summary>
+
+Consider that the thing that needs to scale isn't the number of services — it's the tooling around shipping to one.
+
+</details>
+
+<details><summary>How Instagram does it</summary>
+
+Instagram never had a forcing function that pushed it into microservices — instead it stayed one Django monolith (several million lines, a few thousand endpoints) and invested in the tooling to keep that safe: a canary pipeline (Sauron for release tracking, Jenkins for test gating, Fabric for rollout scripting) pushes new code to a small slice of servers first and only promotes fleet-wide if error rates stay healthy, schema changes ship as feature-toggled dual-read/dual-write paths instead of one-shot migrations, and static-analysis tooling scans the whole codebase for known-bad patterns instead of relying purely on human code review. Cost: a slow or flaky test suite becomes everyone's problem at once, since every engineer's change lands in the same shared codebase.
+
+Deep dive: [The Django monolith at scale](#the-django-monolith-at-scale)
+
+</details>
+
+### Q4. With 1,000+ ranking models in production, how do you notice the moment one of them silently stops working, without a human watching every dashboard?
+
+<details><summary>Hint</summary>
+
+Think about metrics that catch a model quietly degrading toward "no better than a coin flip," not just metrics that catch it crashing.
+
+</details>
+
+<details><summary>How Instagram does it</summary>
+
+Every model in a shared **Model Registry** gets tracked on two health metrics: **calibration** (ratio of predicted to actually-observed click-through rate — 1 is trustworthy) and **normalized entropy** (how well it still separates "will happen" from "won't" — near 1 means it has degraded to guessing). A model breaching its healthy range on either metric gets flagged automatically, and every new model rollout ramps up gradually while shifting traffic — rather than one 100% cutover — so a regression caught mid-rollout only ever affects a bounded slice of traffic.
+
+Deep dive: [What happens when things break](#what-happens-when-things-break)
+
+</details>
 
 ## The problem
 

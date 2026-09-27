@@ -6,6 +6,7 @@
 
 ## Table of contents
 
+- [Before you read: design it yourself](#before-you-read-design-it-yourself)
 - [The problem](#the-problem)
 - [Scale](#scale)
 - [Requirements](#requirements)
@@ -18,6 +19,74 @@
 - [Interview takeaways](#interview-takeaways)
 - [Glossary](#glossary)
 - [Sources](#sources)
+
+## Before you read: design it yourself
+
+Try each question for 5 minutes on your own before reading the "how" — that's the exercise, not a formality.
+
+### Q1. How do you turn one uploaded video file into a dozen-plus playable resolutions without one slow render blocking everything, at 500+ hours uploaded per minute?
+
+<details><summary>Hint</summary>
+
+Think about treating each resolution/codec combination as its own independent job instead of one all-or-nothing task.
+
+</details>
+
+<details><summary>How YouTube does it</summary>
+
+The raw upload lands durably in Colossus (Google's cluster file system) first, then a transcode job is queued rather than run inline — a crash downstream never means re-uploading. A worker fleet fans that job out into a dozen-plus resolution/codec renditions plus thumbnails, each an independently retryable task, so one slow or failed rendition (say, an unusual 8K/AV1 combo) never blocks the others from finishing and going live. Increasingly this runs on Google's own **Argos VCU** chips instead of plain CPUs — purpose-built video-transcoding silicon reported at 20–33x the compute efficiency of the prior all-software pipeline, because at this volume a general-purpose CPU fleet just can't keep up economically.
+
+Deep dive: [Upload ingestion and the transcode fan-out](#upload-ingestion-and-the-transcode-fan-out)
+
+</details>
+
+### Q2. How does the player decide what quality to stream, and why does the cache serving it sometimes live inside your own ISP's building instead of Google's?
+
+<details><summary>Hint</summary>
+
+Split "which quality" (decided live, per segment) from "which server" (decided by physical proximity).
+
+</details>
+
+<details><summary>How YouTube does it</summary>
+
+The player downloads a manifest (DASH) listing every available resolution/codec rendition, then picks and switches quality itself based on its own measured bandwidth and buffer health — the server and every cache in front of it stay completely stateless, never tracking which quality any viewer is on. Physically, most requests never reach a Google data center at all: **Google Global Cache (GGC)** places Google-owned caching boxes directly inside partner ISPs' own networks (1,300+ cities, 200+ countries), so a popular video is served from a box the ISP already owns the last mile to. A miss climbs a hierarchy — GGC, then a peering point, then a regional cluster, then Colossus origin — with each tier absorbing most of what reaches it.
+
+Deep dive: [CDN and edge delivery](#cdn-and-edge-delivery-google-global-cache-and-peering)
+
+</details>
+
+### Q3. A single MySQL database can't hold billions of videos' metadata and continuous view-count writes forever — how do you shard it without every application query needing to know which shard a row lives on?
+
+<details><summary>Hint</summary>
+
+Consider hiding the sharding behind a proxy the application talks to as if it were one database.
+
+</details>
+
+<details><summary>How YouTube does it</summary>
+
+**Vitess** sits between the application and a fleet of MySQL instances: `vtgate` parses each query, hashes the sharding column (usually `video_id`) through a **vindex** function to find the right shard's key range, and routes there — the app never specifies a shard name. `vttablet` fronts each actual MySQL instance, pooling connections and enforcing query safety limits. Choosing `video_id` as the shard key matches YouTube's hottest access pattern (almost everything is scoped to one video), which is what let YouTube's user base scale by more than 50x after adopting Vitess without a rewrite. Cost: any query without a sharding key (e.g. "all videos uploaded today") has to scatter to every shard and merge results — much more expensive than a single-shard lookup.
+
+Deep dive: [Vitess sharding and query routing](#vitess-sharding-and-query-routing)
+
+</details>
+
+### Q4. What happens when a shard's MySQL primary dies mid-write, or you need to reshard live traffic with zero downtime?
+
+<details><summary>Hint</summary>
+
+Think about verifying a copy matches before you ever touch live traffic, and about only racing the replicas that could actually win.
+
+</details>
+
+<details><summary>How YouTube does it</summary>
+
+**VTOrc** continuously watches each shard for a dead or unhealthy primary; when one is confirmed dead it triggers **EmergencyReparentShard**, comparing replicas' replicated position (MySQL GTIDs) to find who's most caught up, racing only those to finish applying logs, and promoting the winner — replicas with no chance of winning are skipped entirely, which is exactly the 2026 hardening fix for a slow straggler stalling the whole failover. Resharding works the same "never take the old thing offline" way: **VReplication** streams changes into a new shard layout while the old one keeps serving 100% of live traffic, a **VDiff** confirms the copy matches, and only then does a small, reversible `SwitchTraffic` step cut over — with automatic reverse-replication in place for rollback.
+
+Deep dive: [Keeping Vitess alive: resharding and automatic failover](#keeping-vitess-alive-resharding-and-automatic-failover)
+
+</details>
 
 ## The problem
 

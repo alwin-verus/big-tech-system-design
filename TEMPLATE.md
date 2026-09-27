@@ -6,6 +6,7 @@
 
 ## Table of contents
 
+- [Before you read: design it yourself](#before-you-read-design-it-yourself)
 - [The problem](#the-problem)
 - [Scale](#scale)
 - [Requirements](#requirements)
@@ -18,6 +19,26 @@
 - [Interview takeaways](#interview-takeaways)
 - [Glossary](#glossary)
 - [Sources](#sources)
+
+## Before you read: design it yourself
+
+Try each question for 5 minutes before reading on. 4 questions that build on each other, each with a hidden hint and answer:
+
+### Q1. <question>
+
+<details><summary>Hint</summary>
+
+One-line nudge.
+
+</details>
+
+<details><summary>How <Company> does it</summary>
+
+The real answer, the trade-off, and a link to the section that covers it.
+
+</details>
+
+Also add a one-page cheat sheet at `cheatsheets/<name>.md` (see any existing one).
 
 ## The problem
 

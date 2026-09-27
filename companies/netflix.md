@@ -6,6 +6,7 @@
 
 ## Table of contents
 
+- [Before you read: design it yourself](#before-you-read-design-it-yourself)
 - [The problem](#the-problem)
 - [Scale](#scale)
 - [Requirements](#requirements)
@@ -18,6 +19,74 @@
 - [Interview takeaways](#interview-takeaways)
 - [Glossary](#glossary)
 - [Sources](#sources)
+
+## Before you read: design it yourself
+
+Try each question for 5 minutes on your own before reading the "how" — that's the exercise, not a formality.
+
+### Q1. When someone taps play, how does the system pick which of thousands of servers around the world actually sends the video bytes?
+
+<details><summary>Hint</summary>
+
+Split the decision (which server) from the request that has to happen first (are you even allowed to watch this).
+
+</details>
+
+<details><summary>How Netflix does it</summary>
+
+PlayAPI (on AWS) resolves a license and manifest first, then asks the **Open Connect steering service** which Open Connect Appliances (OCAs) — Netflix's own boxes racked for free inside ISPs — are healthy, hold this title, and sit close to this client. Steering hands back a *ranked list* of OCAs, not one URL, so the client can fail over to the next candidate itself if the first one stops responding, with no round trip back through AWS. Once that handoff happens, AWS is completely out of the data path.
+
+Deep dive: [Open Connect](#open-connect-placement-fill-and-steering)
+
+</details>
+
+### Q2. Why would a company give away expensive physical hardware for free to ISPs instead of just paying a third-party CDN?
+
+<details><summary>Hint</summary>
+
+Think about what you gain by controlling the actual network path bytes travel, not just who charges less per gigabyte.
+
+</details>
+
+<details><summary>How Netflix does it</summary>
+
+Owning delivery means Netflix controls the network path video takes, instead of sharing a third-party CDN's priorities with every other customer on it. Open Connect Appliances (OCAs) are also proactively, directedly filled overnight with the catalog a given ISP's members are forecast to want, rather than reactively caching whatever gets requested — a directed cache hits far higher offload than a reactive one, but only works because the catalog is finite and demand is forecastable (exactly why live events stress this model differently — see Q4). Cost: enormous capital and logistics, designing, shipping, and remotely operating hardware inside thousands of independently-run networks.
+
+Deep dive: [Open Connect](#open-connect-placement-fill-and-steering)
+
+</details>
+
+### Q3. Different scenes need different amounts of data to look the same quality — how do you avoid burning bandwidth on simple shots just because the same title also has a complex one?
+
+<details><summary>Hint</summary>
+
+Consider optimizing at a finer grain than "one bitrate ladder for the whole title."
+
+</details>
+
+<details><summary>How Netflix does it</summary>
+
+Per-title encoding (2015) tailors the whole bitrate ladder to one title's complexity instead of a single fixed ladder for the entire catalog (~20% average bitrate reduction). Shot-based ("Dynamic Optimizer") encoding goes further, searching the best bitrate/quality trade-off (the "convex hull," scored against Netflix's own VMAF quality metric) per individual shot — a one-hour episode is roughly 900 shots, each optimized independently. Cost: an order of magnitude more encoding compute per title, which pays off because encoding is a one-time cost while every subsequent stream benefits from the savings.
+
+Deep dive: [Per-title and shot-based encoding](#per-title-and-shot-based-dynamic-optimizer-encoding)
+
+</details>
+
+### Q4. What happens to your stream if the entire AWS region running login, recommendations, and manifests disappears while you're mid-episode?
+
+<details><summary>Hint</summary>
+
+Think about which half of the system a client still depends on once it's already playing.
+
+</details>
+
+<details><summary>How Netflix does it</summary>
+
+Because the control plane (AWS) and data plane (Open Connect) barely interact, a client already mid-stream from an OCA doesn't need AWS to keep playing that segment — a region loss mainly threatens *new* session starts (manifest/license requests), not already-playing streams. Netflix rehearses exactly this scenario on purpose with **Chaos Kong**, deliberately simulating the loss of a whole AWS region in production, so "designed to survive a region outage" is also "verified to survive one," not just a hope.
+
+Deep dive: [An entire AWS region goes down](#an-entire-aws-region-goes-down)
+
+</details>
 
 ## The problem
 

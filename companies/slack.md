@@ -14,6 +14,7 @@
 
 ## Table of contents
 
+- [Before you read: design it yourself](#before-you-read-design-it-yourself)
 - [The problem](#the-problem)
 - [Scale](#scale)
 - [Requirements](#requirements)
@@ -26,6 +27,82 @@
 - [Interview takeaways](#interview-takeaways)
 - [Glossary](#glossary)
 - [Sources](#sources)
+
+## Before you read: design it yourself
+
+Try each question for 5 minutes before reading the answer — the "how Slack does it" boxes are collapsed so you're not tempted to peek early.
+
+### Q1. It's 9am Monday and every laptop at a 160,000-person company reconnects within the same few minutes — how do you avoid that being its own mini-outage?
+
+<details>
+<summary>Hint</summary>
+
+Think about what a client actually needs the instant it starts up, versus a full copy of everything the backend knows about the team.
+
+</details>
+
+<details>
+<summary>How Slack does it</summary>
+
+Flannel, an edge cache deployed like the connection layer itself, serves new or reconnecting clients a slimmed-down snapshot instead of the full team data blob — measured at roughly 7x smaller for a 1,500-user team and 44x smaller for a 32,000-user team, with the savings compounding as teams get bigger. It stays current by holding its own live WebSocket back to the main region, and even opportunistically prefetches data (e.g., for a colleague you just @-mentioned) just ahead of when a client will need it.
+
+Deep dive: [Flannel: solving the reconnect storm before it starts](#flannel-solving-the-reconnect-storm-before-it-starts).
+
+</details>
+
+### Q2. How do you route a new message out to every connected device in a channel without every server having to track every open socket?
+
+<details>
+<summary>Hint</summary>
+
+Think about splitting "who owns this channel's data" from "who owns this specific user's live connection" into two different kinds of server.
+
+</details>
+
+<details>
+<summary>How Slack does it</summary>
+
+Channel Servers (stateful, central, own a slice of channels via consistent hashing) hold the source of truth; Gateway Servers (stateful, deployed at the edge near users) hold each client's WebSocket and subscriptions. A Channel Server only ever talks to Gateway Servers, never individual sockets, so adding more edge capacity for connections doesn't require the storage tier to know or care how many sockets exist behind it — the two scale independently.
+
+Deep dive: [Channel Servers and Gateway Servers](#channel-servers-and-gateway-servers-separating-storage-of-truth-from-the-edge).
+
+</details>
+
+### Q3. Your sharding key (workspace ID) stops working because a handful of customers are each bigger than any one shard's hardware — what now?
+
+<details>
+<summary>Hint</summary>
+
+Think about what finer-grained key you could reshard by instead of the whole workspace, and why you might keep MySQL rather than swap databases entirely.
+
+</details>
+
+<details>
+<summary>How Slack does it</summary>
+
+A ~3-year migration onto Vitess (built at YouTube) let Slack reshard by something more flexible than workspace — messages, for instance, by channel ID — so one giant workspace's load spreads across many shards instead of being stuck on one. Slack deliberately rejected NoSQL/NewSQL alternatives to keep MySQL's operational familiarity, and the payoff showed up directly in March 2020, when a 50%-in-one-week pandemic traffic spike let Vitess split an overloaded shard live with zero customer-visible downtime.
+
+Deep dive: [The Vitess migration](#the-vitess-migration-from-one-shard-per-workspace-to-flexible-resharding).
+
+</details>
+
+### Q4. A stateful, in-memory Channel Server crashes — how do you make that a non-event, and what happens when the failure is a whole layer below your application (the network itself)?
+
+<details>
+<summary>Hint</summary>
+
+Think about how few channels should have to move when one server disappears from the ring — then think about what your autoscaler assumes about the network being healthy.
+
+</details>
+
+<details>
+<summary>How Slack does it</summary>
+
+Consistent hashing means losing a Channel Server only reassigns the slice of channels it owned; CHARM (Slack's ring manager) detects the unhealthy host and gets a replacement serving traffic in under 20 seconds via Consul. That doesn't help when the failure is one layer down: on January 4, 2021, a saturated AWS Transit Gateway caused a 5-hour global outage where autoscaling misread "network-starved, so CPU looks idle" as "safe to remove capacity," actively shutting down healthy web servers during the incident — a reminder to check what your control systems assume about the layer underneath them.
+
+Deep dive: [Consistent hashing and CHARM](#consistent-hashing-and-charm-turning-a-stateful-server-crash-into-a-non-event) and [What happens when things break](#what-happens-when-things-break).
+
+</details>
 
 ## The problem
 

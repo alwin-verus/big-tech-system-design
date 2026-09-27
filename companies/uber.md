@@ -20,6 +20,7 @@
 
 ## Table of contents
 
+- [Before you read: design it yourself](#before-you-read-design-it-yourself)
 - [The problem](#the-problem)
 - [Scale](#scale)
 - [Requirements](#requirements)
@@ -32,6 +33,74 @@
 - [Interview takeaways](#interview-takeaways)
 - [Glossary](#glossary)
 - [Sources](#sources)
+
+## Before you read: design it yourself
+
+Try each question for 5 minutes on your own before reading the "how" — that's the exercise, not a formality.
+
+### Q1. How would you store and quickly find nearby drivers, given both riders and drivers keep moving?
+
+<details><summary>Hint</summary>
+
+Think about tiling the map into cells instead of comparing every driver's raw lat/lng to the rider's.
+
+</details>
+
+<details><summary>How Uber does it</summary>
+
+Every GPS point gets turned into a cell ID from **H3**, a hexagonal grid with 16 zoom levels ("resolutions"), so "who's near this rider" becomes a lookup of one cell plus a ring of neighbors instead of geometry over raw coordinates. Hexagons beat the square-ish cells of Uber's earlier system (Google's S2) because every neighbor of a hexagon is the same distance away — no edge-vs-corner special-casing when a search expands outward ring by ring. Cost: you can't tile a sphere with only hexagons, so 12 of the grid's 122 base cells are unavoidably pentagons and need to be handled as an edge case.
+
+Deep dive: [H3](#h3-the-hexagonal-geo-index)
+
+</details>
+
+### Q2. Now you can find nearby drivers — how do you match them to riders fairly, not just "closest driver wins"?
+
+<details><summary>Hint</summary>
+
+Consider waiting a few seconds and solving many requests at once instead of matching the instant one rider taps request.
+
+</details>
+
+<details><summary>How Uber does it</summary>
+
+**DISCO**, Uber's dispatch optimizer, batches a short window of open requests together with available *and soon-to-be-available* drivers (someone about to drop off their current rider), scores every candidate with an ETA model, and solves the whole batch as one assignment problem. This beats greedily grabbing the nearest idle driver, because the driver technically closest to you might be the better match for someone two blocks away. Trade-off: no rider gets an instant answer — there's a deliberate few-second window before an assignment is made.
+
+Deep dive: [DISCO](#disco-the-dispatch-optimizer)
+
+</details>
+
+### Q3. Every driver's phone pings its location every few seconds — how do you handle roughly a million writes a second without the index falling behind?
+
+<details><summary>Hint</summary>
+
+Ask what you're willing to give up: perfectly fresh data everywhere, or the ability to keep writing during a partial failure.
+
+</details>
+
+<details><summary>How Uber does it</summary>
+
+The real-time layer (Supply service, geo-index) runs on **Ringpop**, a library that turns a fleet of Node.js processes into one self-healing, consistently-hashed cluster via gossip, so "who owns this driver's location right now" lives in memory instead of round-tripping to a database on every ping. Ringpop is deliberately **AP, not CP** (available over strictly consistent, in CAP-theorem terms) — a slightly stale driver position is fine, but refusing to accept a location update is not. That's the opposite trade-off from the actual trip/billing record, which needs strong guarantees and lives in Schemaless instead.
+
+Deep dive: [Ringpop](#ringpop-the-self-organizing-cluster)
+
+</details>
+
+### Q4. What happens if the entire datacenter running your trip disappears while you're mid-ride?
+
+<details><summary>Hint</summary>
+
+Think about where trip state could live besides "a database inside that datacenter."
+
+</details>
+
+<details><summary>How Uber does it</summary>
+
+Uber periodically pushes an encrypted "state digest" down to the driver's phone during a trip. When a datacenter failover happens, the next location ping lands somewhere with no record of the trip; the dispatch system detects the gap, asks the phone for its last digest, and reconstructs enough state to keep the trip going as if nothing happened. This only works because the system already treats the driver's phone as a legitimate backup state store — a direct consequence of favoring availability over waiting on cross-datacenter database replication.
+
+Deep dive: [What happens when things break](#what-happens-when-things-break)
+
+</details>
 
 ## The problem
 

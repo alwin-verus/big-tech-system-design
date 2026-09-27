@@ -12,6 +12,7 @@
 
 ## Table of contents
 
+- [Before you read: design it yourself](#before-you-read-design-it-yourself)
 - [The problem](#the-problem)
 - [Scale](#scale)
 - [Requirements](#requirements)
@@ -24,6 +25,82 @@
 - [Interview takeaways](#interview-takeaways)
 - [Glossary](#glossary)
 - [Sources](#sources)
+
+## Before you read: design it yourself
+
+Try each question for 5 minutes before reading the answer — the "how WhatsApp does it" boxes are collapsed so you're not tempted to peek early.
+
+### Q1. How do you hold millions of connections open, when almost all of them are just sitting idle, on a small number of machines?
+
+<details>
+<summary>Hint</summary>
+
+Think about what a normal thread-per-connection web server pays per connection, even an idle one, and what happens when you multiply that by a million.
+
+</details>
+
+<details>
+<summary>How WhatsApp does it</summary>
+
+Every connection gets its own lightweight Erlang process (not an OS thread) on the BEAM VM, running on tuned FreeBSD boxes — cheap enough per-process that one box held ~1M connections on average by 2014 (a 2012 demo hit 2M on a single box). The trade-off: a smaller hiring pool than mainstream stacks, and getting there required patching the BEAM emulator and the FreeBSD kernel itself (socket accounting, `kqueue`), not just picking the "right" language.
+
+Deep dive: [The Erlang/BEAM concurrency model and FreeBSD tuning](#the-erlangbeam-concurrency-model-and-freebsd-tuning).
+
+</details>
+
+### Q2. How do you encrypt a message so thoroughly that not even the company running the servers can read it?
+
+<details>
+<summary>Hint</summary>
+
+Think about how two devices that have never "met" can agree on a secret, and how you make sure leaking one message's key doesn't expose every other message too.
+
+</details>
+
+<details>
+<summary>How WhatsApp does it</summary>
+
+The Signal Protocol: X3DH lets a device start an encrypted session with someone who's offline right now (they pre-uploaded prekeys), then the Double Ratchet derives a fresh key for basically every message, so one leaked key exposes nothing else (forward secrecy). Groups skip pairwise sessions per member (which would be O(n²)) in favor of Sender Keys — one shared symmetric key per group, cheaper but with weaker per-message guarantees than the pairwise scheme.
+
+Deep dive: [The Signal Protocol: X3DH, Double Ratchet, Sender Keys](#the-signal-protocol-x3dh-double-ratchet-sender-keys).
+
+</details>
+
+### Q3. Now one account can be logged in on 5 devices at once — how do you extend that guarantee without ever trusting the phone as the one master key?
+
+<details>
+<summary>Hint</summary>
+
+Think about what has to change if the "server never sees plaintext" promise must hold even when a laptop and a phone are both active at once.
+
+</details>
+
+<details>
+<summary>How WhatsApp does it</summary>
+
+Each device gets its own independent identity key; the server's only job is tracking the current list of device keys per account, never message content. The sender does client-fanout — encrypting once per recipient *device*, not once per recipient person — so a message to someone with 2 linked devices becomes 2 ciphertexts. Trade-off: more sender-side work and bytes on the wire, and revoking one device just means dropping one key from the list rather than invalidating a secret everyone held in common.
+
+Deep dive: [Multi-device architecture: killing the "phone is the source of truth" assumption](#multi-device-architecture-killing-the-phone-is-the-source-of-truth-assumption).
+
+</details>
+
+### Q4. Given the server can't read messages and doesn't want to be a permanent archive, what does it actually have to store — and what happens when a whole layer underneath all of this disappears?
+
+<details>
+<summary>Hint</summary>
+
+Think "envelope vs. letter": routing something still needs an address in the clear, even if the contents are sealed. Then think about what sits one layer below your whole application design.
+
+</details>
+
+<details>
+<summary>How WhatsApp does it</summary>
+
+No `MESSAGES` table at all — the server keeps routing info (who's connected where, in Mnesia), undelivered ciphertext in a small per-recipient queue, device keys, and an encrypted app-state blob, then deletes its own copy once a message is delivered. That minimal footprint didn't save WhatsApp on October 4, 2021: a routine BGP config change withdrew the routes to Meta's own DNS servers, and the whole beautifully fault-tolerant application layer (supervisor trees, offline queues, dual datacenters) went fully dark for six hours because the network layer underneath it disappeared first.
+
+Deep dive: [What the server actually tracks](#3-data-model-what-the-server-actually-tracks) and [What happens when things break](#what-happens-when-things-break).
+
+</details>
 
 ## The problem
 

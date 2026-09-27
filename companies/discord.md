@@ -14,6 +14,7 @@
 
 ## Table of contents
 
+- [Before you read: design it yourself](#before-you-read-design-it-yourself)
 - [The problem](#the-problem)
 - [Scale](#scale)
 - [Requirements](#requirements)
@@ -26,6 +27,82 @@
 - [Interview takeaways](#interview-takeaways)
 - [Glossary](#glossary)
 - [Sources](#sources)
+
+## Before you read: design it yourself
+
+Try each question for 5 minutes before reading the answer — the "how Discord does it" boxes are collapsed so you're not tempted to peek early.
+
+### Q1. Someone posts in a server ("guild") with tens of thousands of people online — how do you notify everyone without the fan-out itself becoming the bottleneck?
+
+<details>
+<summary>Hint</summary>
+
+Think about what "the guild process sends to every member directly" costs once "every member" is 30,000 people, each send costing tens of microseconds.
+
+</details>
+
+<details>
+<summary>How Discord does it</summary>
+
+Before 2017 the guild process really did send directly to every session, taking 900ms–2.1s to fan out in a 30,000-concurrent-member guild. Manifold fixed it by grouping recipients by which of ~20 remote nodes they're connected to, sending one message per node, and letting a relay worker on that node fan out locally (cheap, same-node sends). That turns an O(members) cost on the guild process into a small, roughly constant one.
+
+Deep dive: [Manifold's hierarchical fan-out](#3-signature-component-manifolds-hierarchical-fan-out).
+
+</details>
+
+### Q2. Now scale that same server to 10 million members with over 1 million concurrently online — what has to change?
+
+<details>
+<summary>Hint</summary>
+
+Most people who are "online" in a huge server aren't actually looking at it right now — does everyone need the full event stream?
+
+</details>
+
+<details>
+<summary>How Discord does it</summary>
+
+Maxjourney's answer is to shrink the number of full-fidelity recipients, not just the delivery mechanism: a member not actively viewing the server becomes "passive" and gets a stripped-down update instead of the full stream, cutting fan-out work by roughly 90% for large communities. A second layer of relay processes (each handling up to 15,000 sessions) extends Manifold's per-node worker idea further, pushing the practical ceiling from tens of thousands into the millions.
+
+Deep dive: [Maxjourney: passive sessions and relay for a 10-million-member guild](#maxjourney-passive-sessions-and-relay-for-a-10-million-member-guild).
+
+</details>
+
+### Q3. Message history has to grow into the trillions, across servers from 3 people to 10 million — how do you store that without one database falling over?
+
+<details>
+<summary>Hint</summary>
+
+Think about what happens to a single partition if you key it by channel alone, versus channel plus a time window.
+
+</details>
+
+<details>
+<summary>How Discord does it</summary>
+
+Discord went MongoDB (2015, died at 100M messages when the working set stopped fitting in RAM) to Cassandra (2016, keyed by `channel_id, bucket, message_id` — bucketing ~10 days per partition keeps them under 100MB) to ScyllaDB (2022, same bucketing idea, but shard-per-core C++ instead of JVM, cutting 177 nodes to 72 and removing GC pauses). Each move was forced by a different ceiling: first a hard RAM limit, later an operational-cost ceiling, not a "wrong" choice in hindsight either time.
+
+Deep dive: [From MongoDB to Cassandra to ScyllaDB](#from-mongodb-to-cassandra-to-scylladb-three-databases-in-under-a-decade).
+
+</details>
+
+### Q4. Voice chat during gameplay has near-zero tolerance for lag — how is that handled differently from text, and what happens when the connection layer underneath everything has a bad day?
+
+<details>
+<summary>Hint</summary>
+
+Think about separating "who's in the call" (small, must survive) from "the actual audio bytes" (large, latency-sensitive) — then think about what happens if a third of your session-management pods vanish at once.
+
+</details>
+
+<details>
+<summary>How Discord does it</summary>
+
+Voice signaling (Elixir, same real-time model as text) is a separate service from the actual media relay: a custom C++ Selective Forwarding Unit that just forwards each participant's encrypted stream without decoding or mixing it, with a trimmed-down WebRTC handshake (no ICE, ~1,200-byte SDP instead of ~10KB). When that separation isn't enough — March 25, 2026, a routine Kubernetes config change killed half the session-management pods in one zone at once — the failure cascaded through Gateway memory exhaustion and a million-message voice-syncer backlog, taking over three hours to recover from, precisely because none of the intermediate systems had a graceful-degradation plan for "a large chunk of my peers just disappeared."
+
+Deep dive: [Voice infrastructure: a homegrown SFU and a trimmed-down WebRTC](#voice-infrastructure-a-homegrown-sfu-and-a-trimmed-down-webrtc) and [What happens when things break](#what-happens-when-things-break).
+
+</details>
 
 ## The problem
 

@@ -6,6 +6,7 @@
 
 ## Table of contents
 
+- [Before you read: design it yourself](#before-you-read-design-it-yourself)
 - [The problem](#the-problem)
 - [Scale](#scale)
 - [Requirements](#requirements)
@@ -18,6 +19,82 @@
 - [Interview takeaways](#interview-takeaways)
 - [Glossary](#glossary)
 - [Sources](#sources)
+
+## Before you read: design it yourself
+
+Try each question for 5 minutes before reading the answer — the point is to feel where the hard part is, not to get it "right."
+
+### Q1. How do you get a song playing on a phone in under a second, on any network, anywhere in the world?
+
+<details>
+<summary>Hint</summary>
+
+Think about what you'd have to pre-compute at upload time versus what you'd have to do at request time.
+
+</details>
+
+<details>
+<summary>How Spotify does it</summary>
+
+Audio is pre-encoded into multiple bitrate tiers and chunked at ingest time, not on the fly, so a client can range-request just the next few seconds instead of a whole file. Those chunks are cached at CDN edge nodes close to the listener; Spotify standardized this layer onto Fastly in 2020 after years of squads independently picking Akamai, AWS, or raw GCS/S3 exposure, which made monitoring and governance impossible at scale. Trade-off: storing every track in several bitrate copies multiplies storage cost, and standardizing on one CDN vendor trades away per-squad flexibility for one team owning monitoring and incident response.
+
+Deep dive: [CDN and audio delivery](#cdn-and-audio-delivery-getting-bytes-to-a-phone-in-under-a-second)
+
+</details>
+
+### Q2. With thousands of backend services owned by hundreds of independent teams, how does anyone find out who owns a given service — or stop one team's autonomy from turning into chaos?
+
+<details>
+<summary>Hint</summary>
+
+The fix here isn't code, it's a directory — but not the org chart.
+
+</details>
+
+<details>
+<summary>How Spotify does it</summary>
+
+Spotify built Backstage, an internal developer portal and service catalog, specifically because past 2,000+ services and hundreds of squads, "ask around on Slack" stopped being a viable way to find an owner. Every component (service, website, pipeline) self-registers with a small declarative file naming its owner, docs, and APIs, so ownership is queryable data instead of tribal knowledge. On the people side, Spotify organizes engineers into autonomous squads/tribes with cross-cutting chapters/guilds so the org structure actually matches independently-owned services. Trade-off: building and maintaining this "catalog of catalogs" is itself an ongoing investment that only pays off past a certain scale — Backstage cut onboarding time roughly in half once it did.
+
+Deep dive: [Backstage](#backstage-the-service-catalog-built-because-who-owns-this-stopped-having-an-answer)
+
+</details>
+
+### Q3. How do you capture "the user did X" for every play, skip, and search, at hundreds of millions of events per second, without one broken event type taking down delivery of the other 500+?
+
+<details>
+<summary>Hint</summary>
+
+What's the blast radius if every event type shares one pipeline?
+
+</details>
+
+<details>
+<summary>How Spotify does it</summary>
+
+Each of the 500+ event types gets its own Pub/Sub topic, its own ETL pipeline, and its own storage path, tagged with a priority SLO tier — the stated design principle is "liveness over lateness." Spotify rebuilt this pipeline twice: once moving off self-hosted Kafka (no broker replication, HDFS as the sole durability layer) onto Cloud Pub/Sub in 2017, then again in 2021 to fix "fire-and-forget" mobile clients that silently lost data. Event emission from the client is asynchronous and off the playback critical path, so a degraded pipeline never stops a song from playing. Trade-off: isolating every event type into its own topic/pipeline/SLO means far more independently-monitored moving pieces than one shared pipeline would need.
+
+Deep dive: [Event delivery](#event-delivery-from-a-self-hosted-queue-to-a-managed-one-twice)
+
+</details>
+
+### Q4. How was "a playlist made just for you" computed out of hundreds of millions of other people's listening habits, before you ever opened the app?
+
+<details>
+<summary>Hint</summary>
+
+One signal (what people played together) has an obvious blind spot for brand-new songs — what covers it?
+
+</details>
+
+<details>
+<summary>How Spotify does it</summary>
+
+Discover Weekly blends three independently trained models — collaborative filtering (what similar listeners played), NLP on text written about music, and a CNN on raw audio spectrograms — into one ranked, filtered playlist per user. Collaborative filtering alone can't recommend a new or low-play track (not enough co-listening data yet); the NLP and audio signals exist specifically to cover that gap. It started in 2014 as an unofficial side project by two engineers, then scaled by moving generation onto Cloud Bigtable so playlists could be computed across several days instead of racing to finish every Sunday. Trade-off: three separate model pipelines means three sets of infrastructure, monitoring, and retraining cadence, plus a blending step that itself needs tuning.
+
+Deep dive: [Discover Weekly](#discover-weekly-from-a-side-project-to-a-monday-morning-habit-for-millions)
+
+</details>
 
 ## The problem
 

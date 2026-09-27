@@ -15,6 +15,7 @@
 
 ## Table of contents
 
+- [Before you read: design it yourself](#before-you-read-design-it-yourself)
 - [The problem](#the-problem)
 - [Scale](#scale)
 - [Requirements](#requirements)
@@ -27,6 +28,82 @@
 - [Interview takeaways](#interview-takeaways)
 - [Glossary](#glossary)
 - [Sources](#sources)
+
+## Before you read: design it yourself
+
+Try each question for 5 minutes before reading the answer — the point is to feel where the hard part is, not to get it "right."
+
+### Q1. How does a payment request survive a network failure halfway through and still end up charged exactly once — not zero times, not twice?
+
+<details>
+<summary>Hint</summary>
+
+What does the client send that lets the server recognize "I've already seen this exact request"?
+
+</details>
+
+<details>
+<summary>How Stripe does it</summary>
+
+Every mutating request carries a client-generated `Idempotency-Key`; Stripe stores the first response verbatim and replays it for any later request with the same key, even if the first attempt returned a `500`. A request racing an identical in-flight one gets locked out with a `409`, rather than being allowed to run concurrently and risk double-executing the charge. Keys expire after roughly 24 hours, and reusing a key with different parameters is treated as a client bug and rejected, not silently guessed at. Trade-off: every mutating request now pays an extra read-then-write against the key store before business logic even runs, and that store itself has to be highly available.
+
+Deep dive: [Idempotency keys](#idempotency-keys)
+
+</details>
+
+### Q2. How do you prove, at billions of events a day, that no money silently duplicated or vanished across systems that don't share a database — and notice within hours if it did?
+
+<details>
+<summary>Hint</summary>
+
+What if the database itself isn't allowed to be the source of truth?
+
+</details>
+
+<details>
+<summary>How Stripe does it</summary>
+
+Ledger is an immutable, append-only, double-entry log that every internal producer system publishes into; every transaction's debits must equal its credits, always, as a hard invariant on every write. A data-quality platform on top tracks clearing (do debits/credits balance), timeliness (delay before landing in Ledger), and completeness (did anything upstream go missing), backed by ID-matching and statistical anomaly detection. Because the log is immutable, mistakes get corrected with a new offsetting entry, and any historical balance can be reconstructed exactly by replaying the log. Trade-off: an append-only log grows forever, so "what's my balance" is always an aggregation, not a single-row read, and Stripe had to build dedicated investigation and repair tooling just to make the log operationally usable.
+
+Deep dive: [The ledger](#the-ledger)
+
+</details>
+
+### Q3. How do you protect one shared API fleet, used by hundreds of thousands of businesses, from one noisy caller — without ever being the reason a real payment fails?
+
+<details>
+<summary>Hint</summary>
+
+One limiter can't tell "a bug hammering us" from "we're mid-incident and need to protect payments specifically" — what does?
+
+</details>
+
+<details>
+<summary>How Stripe does it</summary>
+
+Stripe runs four layered rate limiters, each catching what the one before it let through: a per-account token bucket (sustained overuse), a concurrency cap (a few slow/expensive requests), a fleet usage shedder (reserves capacity for critical traffic), and a worker utilization shedder (sheds by priority during an actual incident). Limiters are built to fail open — if the limiter's own dependency (Redis) is unreachable, requests still get served rather than the safety mechanism itself taking down the API. New or changed limits are dark-launched (evaluated against real traffic, logged, not enforced) before they're ever allowed to reject anything. Trade-off: every layer adds a latency hop to every request, and four coordinated systems is real operational surface area — a bug in the limiter itself becomes a new way to take down the whole API.
+
+Deep dive: [Rate limiting](#rate-limiting)
+
+</details>
+
+### Q4. How do you reliably tell a merchant's server that something changed — a payment cleared, a dispute opened — over the open internet, which can drop, stall, or double-deliver a request?
+
+<details>
+<summary>Hint</summary>
+
+What guarantee is actually achievable here, and what does Stripe explicitly not promise?
+
+</details>
+
+<details>
+<summary>How Stripe does it</summary>
+
+Webhooks are signed (HMAC-SHA256 over a timestamp plus payload) and delivered at-least-once, explicitly not exactly-once or ordered — Stripe pushes dedupe-by-event-ID onto the merchant rather than promising a guarantee it can't keep cheaply. Failed deliveries retry automatically for up to 3 days with exponential backoff; a merchant can also manually resend a specific event for 15-30 days afterward. Endpoints are expected to verify the signature, durably record the event, and return `2xx` immediately, before doing the real processing work, because a slow response looks identical to a failure and triggers a retry. Trade-off: the entire ordering and exactly-once burden lands on the merchant's own integration, which is a well-documented source of production bugs when integrators skip it.
+
+Deep dive: [Webhooks](#webhooks)
+
+</details>
 
 ## The problem
 

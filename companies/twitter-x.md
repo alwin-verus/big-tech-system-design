@@ -6,6 +6,7 @@
 
 ## Table of contents
 
+- [Before you read: design it yourself](#before-you-read-design-it-yourself)
 - [The problem](#the-problem)
 - [Scale](#scale)
 - [Requirements](#requirements)
@@ -18,6 +19,82 @@
 - [Interview takeaways](#interview-takeaways)
 - [Glossary](#glossary)
 - [Sources](#sources)
+
+## Before you read: design it yourself
+
+Try each question for 5 minutes before reading the answer — the "how Twitter/X does it" boxes are collapsed so you're not tempted to peek early.
+
+### Q1. How do you generate a unique, roughly time-ordered ID for every tweet across thousands of machines, without one database becoming a bottleneck?
+
+<details>
+<summary>Hint</summary>
+
+Think about packing three different pieces of information — when, which machine, which one of several in the same millisecond — into a single number.
+
+</details>
+
+<details>
+<summary>How Twitter/X does it</summary>
+
+Snowflake packs a 41-bit millisecond timestamp, a 10-bit machine ID (datacenter + worker), and a 12-bit per-millisecond sequence number into one 64-bit integer — any machine can mint an ID with zero coordination with any other machine, and because the timestamp is the high-order bits, sorting by ID is approximately sorting by creation time for free. The cost: clocks have to stay roughly in sync, and a machine whose clock jumps backward has to refuse to generate IDs rather than risk a collision.
+
+Deep dive: [Snowflake: minting unique IDs without a central counter](#snowflake-minting-unique-ids-without-a-central-counter).
+
+</details>
+
+### Q2. A pop star with 30 million followers posts — how do you get that tweet in front of all of them without turning one write into 30 million synchronous writes?
+
+<details>
+<summary>Hint</summary>
+
+Think about whether every follower needs the tweet pushed to them the instant it's posted, or whether some of them can just fetch it when they next look.
+
+</details>
+
+<details>
+<summary>How Twitter/X does it</summary>
+
+Hybrid fan-out: for a normal account, the fanout daemon pushes the new tweet ID into every follower's precomputed Redis timeline list at post time (cheap). Past a follower-count threshold, nothing gets pushed at all — the tweet just sits in the author's own timeline, and every follower's *next* read does a small live merge to pick it up. One strategy for every account is the trap most candidates fall into; naming the follower-count split is the actual answer.
+
+Deep dive: [Fan-out on write vs. fan-out on read: the celebrity problem](#fan-out-on-write-vs-fan-out-on-read-the-celebrity-problem).
+
+</details>
+
+### Q3. Out of a candidate pool that can run into the hundreds of millions of tweets, how do you rank and return a personalized "For You" feed in about a second?
+
+<details>
+<summary>Hint</summary>
+
+Think about why you'd never run an expensive neural network over hundreds of millions of items directly — what has to happen first to make that affordable?
+
+</details>
+
+<details>
+<summary>How Twitter/X does it</summary>
+
+A narrowing funnel: candidate sourcing (Earlybird for in-network, Tweet-Mixer/UTEG/Cr-Mixer for out-of-network) pulls the pool down to ~1,500 candidates, a cheap logistic-regression Light Ranker filters those further, and only then does the expensive neural-network Heavy Ranker (served by Navi) score what's left. One full pipeline run burns ~220 seconds of CPU time yet returns in under 1.5 seconds wall-clock, and it runs ~5 billion times a day — exactly why the cheap stage isn't optional, it's load-bearing for the whole thing being affordable at all.
+
+Deep dive: [The "For You" ranking pipeline](#the-for-you-ranking-pipeline-candidate-sourcing-to-heavy-ranker).
+
+</details>
+
+### Q4. What happens when an entire datacenter goes fully offline in a heat wave — and how many datacenters is actually "enough"?
+
+<details>
+<summary>Hint</summary>
+
+Think N-1, not N: it's not about how many sites you have, it's about how many you can lose at once and still be fine.
+
+</details>
+
+<details>
+<summary>How Twitter/X does it</summary>
+
+In September 2022, a record heat wave took Twitter's Sacramento-area datacenter fully offline — "total shutdown of physical equipment" — leaving only Atlanta and Portland standing. Tweet and timeline data survived because Manhattan replicates across sites rather than living on one, but running on just three core datacenters meant Twitter was reported to be in a "non-redundant state" for days: losing one more site could plausibly have meant the service going offline for weeks or longer.
+
+Deep dive: [A datacenter dies](#a-datacenter-dies).
+
+</details>
 
 ## The problem
 

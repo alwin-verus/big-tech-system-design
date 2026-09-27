@@ -6,6 +6,7 @@
 
 ## Table of contents
 
+- [Before you read: design it yourself](#before-you-read-design-it-yourself)
 - [The problem](#the-problem)
 - [Scale](#scale)
 - [Requirements](#requirements)
@@ -18,6 +19,82 @@
 - [Interview takeaways](#interview-takeaways)
 - [Glossary](#glossary)
 - [Sources](#sources)
+
+## Before you read: design it yourself
+
+Try each question for 5 minutes before reading the answer — the point is to feel where the hard part is, not to get it "right."
+
+### Q1. How does the sync engine know exactly which bytes changed without comparing whole files — so editing one paragraph of a 40-page doc doesn't re-upload the whole thing?
+
+<details>
+<summary>Hint</summary>
+
+What's cheaper to compare than raw bytes?
+
+</details>
+
+<details>
+<summary>How Dropbox does it</summary>
+
+Nucleus splits a changed file into fixed 4MB blocks, fingerprints each with SHA-256, and asks the metadata service which hashes it already has for the account — only genuinely new blocks get uploaded. Because the check happens before any bytes move, the dedupe savings are real bandwidth savings, not just a storage-side optimization; it works whether the duplicate is an older revision or a completely different user's file. Blocks are compressed client-side (Broccoli, a modified Brotli) before upload, and the server decompresses and re-verifies the hash so a client can't claim a hash for content it isn't sending. Trade-off: fixed-size blocks are simple and fully deterministic, but inserting even a few bytes near the start of a large file shifts every later block boundary, silently breaking dedupe against the previous version until a full re-chunk.
+
+Deep dive: [Block hashing and dedupe](#block-hashing-and-dedupe)
+
+</details>
+
+### Q2. At exabyte scale, where "a disk failed" isn't an incident, it's Tuesday — how do you keep data durable without paying for 2-3 full extra copies of everything?
+
+<details>
+<summary>Hint</summary>
+
+What if you could rebuild a lost piece from the pieces you still have, instead of storing full copies?
+
+</details>
+
+<details>
+<summary>How Dropbox does it</summary>
+
+Magic Pocket erasure-codes closed, immutable volumes — Reed-Solomon 6+3 (1.5x overhead, tolerates losing any 3 of 9 fragments) and a newer LRC-(12,2,2) scheme (1.33x overhead) — instead of 3x+ replication. Volumes stay heavily replicated (8x) only while still open and accepting writes; once closed, they're never reopened, which is exactly what makes the aggressive erasure-coding overhead safe. Fragments spread across independent 100+PB storage cells, each with its own coordinator, so a problem in one cell can't take down the whole fleet; a lost fragment rebuilds from survivors under a 48-hour repair SLA. Trade-off: reconstructing even one lost fragment costs real CPU and cross-node bandwidth, and Dropbox now owns the operational burden of running its own data-center hardware that renting S3 used to make someone else's problem.
+
+Deep dive: [Magic Pocket](#magic-pocket)
+
+</details>
+
+### Q3. How do you actually know your durability numbers are true, rather than just claimed, when corruption can happen silently with no hardware alarm at all?
+
+<details>
+<summary>Hint</summary>
+
+If nothing goes looking for a problem, how would you ever find out before a customer does?
+
+</details>
+
+<details>
+<summary>How Dropbox does it</summary>
+
+Pocket Watch runs three always-on verifiers: the Disk Scrubber (re-reads every bit against checksums every 1-2 weeks), the Metadata Scanner (cross-checks the Block Index against real placement at ~1M blocks/sec), and the Storage Watcher (samples ~1% of writes for up to a month after they land). Together these are why Magic Pocket's theoretical durability target reaches "27 nines" — a number about how unlikely undetected data loss becomes, not a claim about any one disk. Dropbox doesn't just trust the verifiers work — engineers deliberately corrupt test data on purpose to confirm each one actually catches it. Trade-off: verification isn't a background afterthought, it's over half of all disk and database load in the entire system — a large, permanent tax paid continuously whether or not anything is actually broken.
+
+Deep dive: [Pocket Watch: continuous verification](#pocket-watch-continuous-verification)
+
+</details>
+
+### Q4. How do you keep metadata — names, folders, permissions — consistent and fast across hundreds of millions of devices, once hand-managed, sharded MySQL stops scaling?
+
+<details>
+<summary>Hint</summary>
+
+Most access to your own stuff is "local" — can you exploit that to make the common case cheap?
+
+</details>
+
+<details>
+<summary>How Dropbox does it</summary>
+
+Edgestore introduces colos — placing data that's usually read and written together (a user's own files and folders) on the same physical MySQL shard, giving cheap strong consistency for the common case by construction. The rarer cross-shard operations (5-10% of traffic) go through a modified two-phase commit with copy-on-write staging, cutting write amplification by up to 95% versus duplicating the whole object. As Edgestore's own "split the whole fleet to add capacity" model hit its own ceiling, Dropbox built Alki (cold data moved to a cheap DynamoDB+S3 tier) and Panda (incremental, small-range rebalancing) underneath it. Trade-off: strong consistency by default means every write invalidates caches, and running three overlapping metadata systems during the transition is itself an ongoing operational cost.
+
+Deep dive: [Edgestore](#edgestore)
+
+</details>
 
 ## The problem
 
