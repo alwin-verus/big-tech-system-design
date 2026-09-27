@@ -20,10 +20,14 @@ jobs:
         id: lychee
         uses: lycheeverse/lychee-action@v2
         with:
-          # 403/429/999: sites (Medium, LinkedIn, Meta) that block bots but work in a browser
+          # 403/406/429/999: sites (Medium, Uber, LinkedIn) that block bots but work in a browser.
+          # Meta/WhatsApp answer bots with 400; eventil.com has a broken TLS chain. Both load fine in a browser.
           args: >-
             --no-progress
-            --accept 200,204,206,403,429,999
+            --accept 200,204,206,403,406,429,999
+            --exclude 'whatsapp\.com'
+            --exclude 'ai\.meta\.com'
+            --exclude 'eventil\.com'
             --max-retries 3
             --timeout 30
             --user-agent "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/128 Safari/537.36"
