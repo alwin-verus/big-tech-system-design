@@ -1,6 +1,6 @@
 # Spotify: how a song starts in under a second, and how the app already knew you'd want to hear it
 
-> **In 60 seconds:** Spotify streams audio that's pre-encoded into multiple bitrates and chunked at ingest time, cached at CDN edges (standardized on Fastly in 2020), so a phone on patchy mobile data can start playback from a nearby cache instead of a distant origin server. Behind that sits a large, decentralized backend — thousands of independent microservices owned by autonomous "squads" — that Spotify catalogs through Backstage, an internal developer portal it built after engineers could no longer find who owned what, and later donated to the Cloud Native Computing Foundation (CNCF). Every user action (play, skip, search) is logged as an event and pushed through a cloud event-delivery pipeline — self-hosted Kafka until 2017, then Google Cloud Pub/Sub and Dataflow — into a data warehouse and feature stores that train machine learning models. Discover Weekly, one of the best-known outputs of that pipeline, blends three independently trained models (collaborative filtering, NLP on text about music, and a neural net on raw audio) into one playlist per user, recomputed and delivered every Monday. All of this now runs on Google Cloud Platform, which Spotify moved onto entirely between 2016 and 2018 after concluding it didn't want to keep running its own data centers.
+> **In 60 seconds:** Spotify streams audio in several fixed bitrate tiers, cached at CDN edges (Fastly, plus Akamai and AWS for audio; other content was standardized on Fastly in 2020), so a phone on patchy mobile data can start playback from a nearby cache instead of a distant origin server. Behind that sits a large, decentralized backend — thousands of independent microservices owned by autonomous "squads" — that Spotify catalogs through Backstage, an internal developer portal it built after engineers could no longer find who owned what, and later donated to the Cloud Native Computing Foundation (CNCF). Every user action (play, skip, search) is logged as an event and pushed through a cloud event-delivery pipeline — self-hosted Kafka until 2017, then Google Cloud Pub/Sub and Dataflow — into a data warehouse and feature stores that train machine learning models. Discover Weekly, one of the best-known outputs of that pipeline, combines three kinds of signal (other listeners' playlists and listening logs, web text about music, and audio spectrograms) into one playlist per user, recomputed and delivered every Monday. All of this now runs on Google Cloud Platform, which Spotify moved onto entirely between 2016 and 2018 after concluding it didn't want to keep running its own data centers.
 
 **Last reviewed:** September 2026 · **Difficulty:** Intermediate · **Reading time:** ~20 min
 
@@ -9,6 +9,7 @@
 - [Before you read: design it yourself](#before-you-read-design-it-yourself)
 - [The problem](#the-problem)
 - [Scale](#scale)
+- [Back-of-the-envelope math](#back-of-the-envelope-math)
 - [Requirements](#requirements)
 - [How it evolved](#how-it-evolved)
 - [High-level design](#high-level-design)
@@ -36,7 +37,7 @@ Think about what you'd have to pre-compute at upload time versus what you'd have
 <details>
 <summary>How Spotify does it</summary>
 
-Audio is pre-encoded into multiple bitrate tiers and chunked at ingest time, not on the fly, so a client can range-request just the next few seconds instead of a whole file. Those chunks are cached at CDN edge nodes close to the listener; Spotify standardized this layer onto Fastly in 2020 after years of squads independently picking Akamai, AWS, or raw GCS/S3 exposure, which made monitoring and governance impossible at scale. Trade-off: storing every track in several bitrate copies multiplies storage cost, and standardizing on one CDN vendor trades away per-squad flexibility for one team owning monitoring and incident response.
+Audio is offered in fixed bitrate tiers, encoded ahead of time rather than on the fly, and cached at CDN edge nodes close to the listener (a reference design would also chunk files so clients can range-request the next few seconds). Audio ran on a multi-CDN setup (Akamai and AWS, plus Fastly) that worked well; everything else (images, client updates) had fragmented, with some squads serving straight from S3/GCS buckets, so in 2020 a new CDN squad standardized that on Fastly. Trade-off: storing every track in several bitrate copies multiplies storage cost, and standardizing on one CDN vendor trades away per-squad flexibility for one team owning monitoring and incident response.
 
 Deep dive: [CDN and audio delivery](#cdn-and-audio-delivery-getting-bytes-to-a-phone-in-under-a-second)
 
@@ -90,7 +91,7 @@ One signal (what people played together) has an obvious blind spot for brand-new
 <details>
 <summary>How Spotify does it</summary>
 
-Discover Weekly blends three independently trained models — collaborative filtering (what similar listeners played), NLP on text written about music, and a CNN on raw audio spectrograms — into one ranked, filtered playlist per user. Collaborative filtering alone can't recommend a new or low-play track (not enough co-listening data yet); the NLP and audio signals exist specifically to cover that gap. It started in 2014 as an unofficial side project by two engineers, then scaled by moving generation onto Cloud Bigtable so playlists could be computed across several days instead of racing to finish every Sunday. Trade-off: three separate model pipelines means three sets of infrastructure, monitoring, and retraining cadence, plus a blending step that itself needs tuning.
+Discover Weekly combines three kinds of signal — what similar listeners played (collaborative filtering), text written about music, and audio spectrograms — into one filtered playlist per user. Collaborative filtering alone can't recommend a new or low-play track (not enough co-listening data yet); the NLP and audio signals exist specifically to cover that gap. It started in 2014 as an unofficial side project by two engineers, then scaled by moving generation onto Cloud Bigtable so playlists could be computed across several days instead of racing to finish every Sunday. Trade-off: three separate model pipelines means three sets of infrastructure, monitoring, and retraining cadence, plus a blending step that itself needs tuning.
 
 Deep dive: [Discover Weekly](#discover-weekly-from-a-side-project-to-a-monday-morning-habit-for-millions)
 
@@ -112,10 +113,9 @@ None of these are one-time engineering problems solved once and left alone. Spot
 |---|---|---|
 | Monthly active users | 777M (Q2 2026) | [10](#sources) |
 | Premium subscribers | 300M (Q2 2026) | [10](#sources) |
-| Backend services, websites, data pipelines managed in Backstage | 2,000+ services, 300+ websites, 4,000+ data pipelines, 200+ mobile features (early 2020) | [1](#sources) |
-| Engineering teams using Backstage | 280+ teams (early 2020) | [1](#sources) |
+| Backend services, websites, data pipelines managed in Backstage | 2,000+ backend services, 300 websites, 4,000 data pipelines (late 2010s) | [21](#sources) *(third-party)* |
 | Software components / doc sites cataloged at open-source launch | ~14,000 software components; ~5,000 documentation sites, ~10,000 daily doc hits | [21](#sources) *(third-party)* |
-| Onboarding time reduction from Backstage | ~55% decrease (roughly cut in half) | [1](#sources) |
+| Onboarding time reduction from Backstage | Cut in half [1]; ~55% per a third-party write-up [21] | [1](#sources)[21](#sources) |
 | Services/data moved to GCP | 2,000+ services, 20,000 daily data-pipeline runs, 100+ PB stored data, 100 teams across 4 regions | [3](#sources) |
 | Scale at time GCP decision was announced (2016) | 75M+ users, 2B+ playlists, 30M+ songs | [18](#sources) *(third-party)* |
 | On-prem data centers retired | 4 (1 closed Dec 2017, remaining 3 through 2018) | [3](#sources) |
@@ -125,7 +125,7 @@ None of these are one-time engineering problems solved once and left alone. Spot
 | Distinct event types on the pipeline | 500-600+ | [4](#sources)[5](#sources) |
 | Discover Weekly early adoption | Rolled out mid-2015 to ~100M active users; ~40M dedicated listeners within about a year; ~1TB new data processed weekly | [7](#sources) *(third-party)* |
 | CDN squad adoption | 60+ squads (~20% of R&D), 80+ services routed through Fastly by Feb 2020 | [8](#sources) |
-| Backstage external contribution rate (CNCF Sandbox, 2020) | 130+ contributors, ~40% of PRs from outside Spotify | [12](#sources) |
+| Backstage external contribution rate (CNCF Sandbox, 2020) | 130+ contributors in total, ~40% of PRs from outside Spotify | [12](#sources) |
 | Engineering teams when the squad/tribe model was documented | 30+ teams (2012) | [19](#sources) *(third-party)* |
 | TFX/Kubeflow ML platform, alpha (Aug 2019) | ~100 users, ~18,000 pipeline runs, some teams ran ~7x more experiments | [9](#sources) |
 | 2022 outage duration/impact | March 8, 2022, 18:12-20:35 UTC (~2h23m), users logged out worldwide | [15](#sources) |
@@ -137,6 +137,125 @@ What these numbers mean, put together:
 - The event-delivery figures show this isn't a small-data problem: by 2019 the pipeline moved roughly as much raw data per day (350TB) as many companies' entire data warehouses hold in total — and did it 500 billion times over, since every one of those events is a single "user did X" fact that has to survive being copied across a network, deduplicated, and routed into the right one of 500+ separate pipelines.
 - The Backstage numbers show the organizational side of scale: past a few thousand services and hundreds of teams, "ask around on Slack" stops working as a way to find an owner — this is a people problem that got solved with software.
 - The outage durations (2-3.5 hours each) look small next to 777M monthly users, but at Spotify's scale even a short global outage touches a very large fraction of a very large user base at once — which is why each of the three incidents got a detailed public write-up rather than a quiet fix.
+
+## Back-of-the-envelope math
+
+Back-of-the-envelope math is the rough, order-of-magnitude arithmetic engineers do on a whiteboard to size a system before building it — not a precise forecast. Inputs marked with a [n] reference are pulled straight from this page's Scale table or cited body text; everything else is a labeled `Assumption:` used purely for illustration.
+
+### Peak concurrent streaming bandwidth
+
+**Question:** Roughly how much aggregate bandwidth does Spotify's CDN edge need at peak, just for audio?
+
+**Inputs:**
+- Monthly active users: 777M (Q2 2026) [10](#sources)
+- "High" quality bitrate tier: ~160 kbps [11](#sources)
+- Assumption: peak concurrent listeners ≈ 3% of MAU (typical single-digit peak-concurrency share for a global, always-on app)
+
+**Math:**
+```text
+peak_concurrent_listeners = 777,000,000 * 0.03
+                           = 23,310,000 listeners
+
+bandwidth_per_stream      = 160,000 bits/sec   (160 kbps)
+
+total_bandwidth           = 23,310,000 * 160,000 bits/sec
+                           = 3,729,600,000,000 bits/sec
+                           = 3,729.6 Gbps
+                           ≈ 3.73 Tbps
+
+total_bandwidth (bytes)   = 3,729,600,000,000 / 8
+                           = 466,200,000,000 bytes/sec
+                           ≈ 466 GB/s
+```
+
+**Answer:** ~3.7 Tbps (~466 GB/s) of aggregate peak audio bandwidth, rounded to ~4 Tbps.
+
+**What it tells you:** at multiple terabits per second, no single origin data center serves this economically — which is why audio specifically ran multi-CDN (Akamai + AWS, plus Fastly) rather than from one vendor. See [CDN and audio delivery](#cdn-and-audio-delivery-getting-bytes-to-a-phone-in-under-a-second).
+
+### Does the event pipeline's stated peak match its daily average?
+
+**Question:** The page cites both an 8M events/sec peak and 500B+ events/day for the same era — are those two sourced numbers actually consistent with each other?
+
+**Inputs:**
+- Event delivery throughput, GCP era: ~8M events/sec peak, 500B+ events/day (Q1 2019) [5](#sources)
+- Rule of thumb: peak traffic ≈ 2-3x daily average
+
+**Math:**
+```text
+average_events_per_sec = 500,000,000,000 events / 86,400 sec/day
+                        ≈ 5,787,037 events/sec
+                        ≈ 5.8M events/sec
+
+peak_to_average_ratio  = 8,000,000 / 5,787,037
+                        ≈ 1.38x
+```
+
+**Answer:** ~5.8M events/sec average vs. the stated 8M/sec peak — only ~1.4x, well under the usual 2-3x rule of thumb.
+
+**What it tells you:** a flatter-than-typical peak/average ratio is what you'd expect from a user base spread across time zones, where regional peaks overlap and smooth the aggregate curve — but that smoothness is only true in aggregate. It's consistent with the page's own design choice to give each of the 500+ event types its own topic and SLO in [Event delivery](#event-delivery-from-a-self-hosted-queue-to-a-managed-one-twice), since any single event type or region can still spike hard even while the total looks calm.
+
+### Storage for one copy of the catalog across every bitrate tier
+
+**Question:** How much storage does pre-encoding the entire catalog into all four bitrate tiers actually cost?
+
+**Inputs:**
+- Catalog size at the time of the GCP decision: 30M+ songs (2016) [18](#sources)
+- Bitrate tiers: Low ~24 kbps, Normal ~96 kbps, High ~160 kbps, Very High ~320 kbps [11](#sources)
+- Assumption: average track length ≈ 3.5 minutes (210 seconds)
+
+**Math:**
+```text
+size(bitrate) = bitrate(bits/sec) * duration(sec) / 8 (bits -> bytes)
+
+24 kbps:  24,000 * 210 / 8  =   630,000 bytes = 0.63 MB
+96 kbps:  96,000 * 210 / 8  = 2,520,000 bytes = 2.52 MB
+160 kbps: 160,000 * 210 / 8 = 4,200,000 bytes = 4.20 MB
+320 kbps: 320,000 * 210 / 8 = 8,400,000 bytes = 8.40 MB
+
+per_track_total = 0.63 + 2.52 + 4.20 + 8.40 = 15.75 MB
+
+catalog_total   = 30,000,000 songs * 15.75 MB
+                = 472,500,000 MB
+                = 472,500 GB
+                ≈ 472.5 TB
+                ≈ 0.47 PB
+```
+
+**Answer:** ~0.47 PB (rounded to ~0.5 PB) for one master copy of every track across all four tiers.
+
+**What it tells you:** that's a small slice of the "100+ PB stored data" cited for the GCP migration — meaning it's event and analytics data, not audio bytes, that dominates Spotify's total storage footprint. See [CDN and audio delivery](#cdn-and-audio-delivery-getting-bytes-to-a-phone-in-under-a-second).
+
+### Discover Weekly's sustained compute rate
+
+**Question:** How many playlists per second does the Discover Weekly batch job need to produce, sustained, to finish before Monday?
+
+**Inputs:**
+- Monthly active users: 777M [10](#sources)
+- Assumption: Discover Weekly is generated for roughly half of MAU (users with enough listening history for a taste profile)
+- Assumption: the recompute window is ~2 days, per the page's description of moving generation "across several days instead of racing to finish every Sunday"
+
+**Math:**
+```text
+users_served      = 777,000,000 * 0.5        = 388,500,000 users
+window_seconds    = 2 days * 86,400 sec/day  = 172,800 sec
+
+playlists_per_sec = 388,500,000 / 172,800
+                   ≈ 2,249 playlists/sec
+```
+
+**Answer:** ~2,250 playlists/sec, sustained across the compute window.
+
+**What it tells you:** a rate like that only works spread across days of batch infrastructure (Bigtable-backed), not squeezed into one overnight job — which is exactly why moving generation off a single-night deadline was the fix described in [Discover Weekly](#discover-weekly-from-a-side-project-to-a-monday-morning-habit-for-millions).
+
+### Rules of thumb used
+
+| Rule of thumb | Value |
+|---|---|
+| 1 day | ~86,400 s ≈ 10^5 s |
+| Byte units | 1 KB/MB/GB/TB/PB = 10^3/10^6/10^9/10^12/10^15 bytes (decimal, not binary) |
+| Peak vs. average traffic | ~2-3x, for a typical consumer app |
+
+These are general estimation conventions, not Spotify-specific facts.
 
 ## Requirements
 
@@ -162,7 +281,7 @@ What these numbers mean, put together:
 - Failure isolation — a broken event type or pipeline must not stop delivery of the other 500+ event types.
   *Why it matters: given how many independent things flow through one pipeline, a single noisy or broken feature shouldn't be able to take the rest of the system down with it.*
 - Fast, safe rollout across a very large, decentralized microservice fleet.
-  *Why it matters: two of Spotify's three published global outages (2022, 2025) were triggered by a config or code change rolled out everywhere at once — the ability to change things safely at that scale is itself a non-functional requirement.*
+  *Why it matters: the 2025 global outage was triggered by a config change rolled out to every region at once, and the 2023 one by a change in a DNS component — the ability to change things safely at that scale is itself a non-functional requirement.*
 
 ## How it evolved
 
@@ -174,13 +293,13 @@ What these numbers mean, put together:
 | 2014 | Discover Weekly built as a side project | Two engineers, including Edward Newett, built an early version outside any official roadmap, motivated by a discovery problem they personally saw [7]. |
 | 2015 (mid-year) | Discover Weekly launches broadly | Rolled out to Spotify's then ~100M active users; reached ~40M dedicated listeners within about a year, processing roughly a terabyte of new data weekly [7]. |
 | 2016 (Feb) | Decision to leave data centers | Spotify announced it would move onto Google Cloud Platform, stating plainly it was "fundamentally in the music business and not to build data centers" — at the time, ~75M users, 2B+ playlists, 30M+ songs [3][18]. |
-| 2017 (May) | Cutover complete | All production traffic was routed to GCP; the Kafka-based event pipeline was decommissioned in favor of Cloud Pub/Sub, Dataflow, and BigQuery [3][5]. |
+| 2017 (May) | Cutover complete | All production traffic was routed to GCP; the Kafka-based event pipeline had already been shut down in February 2017 in favor of Cloud Pub/Sub, Dataflow, and BigQuery [3][5]. |
 | 2017-2018 | Data centers closed | The first of four owned data centers closed in December 2017; the remaining three were retired through 2018 [3]. |
 | 2019 (Oct) | Backstage's first commit | Internally, Spotify had grown to 2,000+ services, 300+ websites, and 4,000+ data pipelines, and engineers were losing time hunting for owners and documentation. The rewrite that became Backstage had its first commit October 1, 2019 [1][21]. |
 | 2019 | ML infra standardized | After a first-generation, Scala-based ML tooling stack (Featran, Noether, Zoltar) went largely unused by Python-centric ML engineers, Spotify rebuilt its "Paved Road" for machine learning on TensorFlow Extended (TFX) and, from 2018-2019, Kubeflow Pipelines on Kubernetes [9]. |
-| 2020 (Feb) | CDN standardized | Years of squads independently choosing CDNs (Akamai, AWS, direct GCS/S3 exposure) were consolidated onto Fastly, after the fragmentation made monitoring and governance impractical at scale [8]. |
-| 2020 (Mar) | Backstage open-sourced | Spotify released Backstage as open source, its first major open-source infrastructure platform [1][2]. |
-| 2020 (Sep) | Donated to CNCF | Backstage was accepted into the CNCF Sandbox on September 24, 2020, with 130+ external contributors already involved [12]. |
+| 2020 (Feb) | CDN standardized | Audio's multi-CDN setup (Akamai, AWS) worked well, but delivery of everything else had fragmented (some content served straight from S3/GCS buckets); a new CDN squad consolidated it onto Fastly [8]. |
+| 2020 (Mar) | Backstage open-sourced | Spotify released Backstage as open source [1][2]. |
+| 2020 (Sep) | Donated to CNCF | Backstage was accepted into the CNCF Sandbox on September 24, 2020, with 130+ contributors and roughly 40% of pull requests coming from outside Spotify [12]. |
 | 2021 | Event pipeline rebuilt again | The 2017-era Pub/Sub pipeline still had gaps: mobile clients sent events "fire-and-forget" with real data loss, and schema changes took hours to propagate. Spotify redesigned the receiver and dedup layers around Dataflow/Beam while migrating 600+ live event types with (per the team's own description) "the wheels on a moving bus" [4]. |
 | 2022 (Mar) | Global outage | A Google Cloud Traffic Director failure combined with a gRPC client bug broke login for services depending on that service-discovery path; recovery came from falling back to DNS-based discovery [15]. |
 | 2023 (Jan) | Global outage | Routine GitHub Enterprise maintenance cascaded into an internal DNS resolver failure, eventually taking down most functionality including playback [16]. |
@@ -212,12 +331,12 @@ flowchart LR
 
 Walk-through:
 
-1. A client requests to play a track. The request goes to backend microservices for metadata/permission checks, and the audio itself is fetched from CDN-cached object storage — audio files are pre-encoded to multiple bitrates and chunked at ingest time so the CDN can cache and range-serve them [8][11].
-2. Spotify standardized its CDN layer on Fastly in 2020 after years of using Akamai, AWS, and direct GCS/S3 exposure across independent squads, because the fragmented setup made monitoring and governance hard at scale [8].
+1. A client requests to play a track. The request goes to backend microservices for metadata/permission checks, and the audio itself is fetched from CDN-cached object storage — audio is offered in fixed bitrate tiers [11] and served through CDNs [8]. *(Chunking and range requests are a reference design; [8] and [11] don't describe the storage format.)*
+2. Audio used a multi-CDN setup (Akamai and AWS, plus Fastly) that worked well; in 2020 Spotify standardized delivery of everything else (images, client updates, some served straight from S3/GCS buckets) on Fastly, because the fragmented setup made monitoring and governance hard [8].
 3. All backend functionality is split into microservices owned by autonomous squads; every service, website, and data pipeline is registered in Backstage, the internal developer portal Spotify built specifically because engineers could no longer find who owned what, and later donated to the CNCF [1][2][19].
 4. Every user action in the client (play, skip, search, etc.) is logged as an event and sent to a receiver service. From 2013-2017 this fed a self-hosted Kafka + Storm + Hadoop pipeline; from 2017 onward events flow into Google Cloud Pub/Sub instead [4][5][6].
 5. Dataflow (built on Apache Beam/Scio) jobs consume from Pub/Sub, deduplicate, and route each of the 500+ event types independently into Cloud Storage and BigQuery, so a stuck or broken event type doesn't block the rest of the pipeline [4][5].
-6. Processed listening data and metadata feed Spotify's recommendation models. Discover Weekly blends three independently trained models — collaborative filtering, NLP, and audio CNNs — and moved from dedicated servers onto Google Cloud Bigtable so playlists could be precomputed across several days instead of all at once every Sunday [7].
+6. Processed listening data and metadata feed Spotify's recommendation models. Discover Weekly draws on listening logs, other users' playlists, web text, and audio spectrograms, and moved from its own servers onto Google Cloud Bigtable so playlists could be precomputed across several days instead of all at once every Sunday [7].
 7. Spotify's whole services and data estate moved off four self-owned data centers onto GCP between 2016 and 2018, on the reasoning that the company should spend engineering time on the music product, not on data-center operations [3].
 
 ## Low-level design
@@ -338,7 +457,7 @@ flowchart TB
   Filter --> Weekly["Discover Weekly playlist<br/>(refreshed Monday)"]
 ```
 
-Each of the three models is trained and scored largely independently, then combined into a per-user ranked candidate list before already-heard tracks are filtered out and the playlist is written ahead of Monday delivery [7]. The reason for three separate models rather than one: collaborative filtering is powerful but blind for new or low-play-count tracks (there isn't enough co-listening data yet), so the NLP and audio-CNN signals exist specifically to cover that gap — a brand-new song can still be recommended on the strength of what it sounds like and what's being written about it, before enough people have streamed it for collaborative signals to kick in [7]. A related, separately documented system — BaRT (Bandits for Recommendations as Treatments), described in a 2018 Spotify Research paper — uses a multi-armed-bandit approach to decide which recommendation shelves and cards appear on the Home screen, balancing "show what we're confident you'll like" against "show something uncertain so we learn more" [20]. It is a distinct system from the three-model Discover Weekly blend above, but solves an adjacent problem with the same underlying data.
+Each of the three models is trained and scored largely independently, then combined into a per-user ranked candidate list before already-heard tracks are filtered out and the playlist is written ahead of Monday delivery [7]. *(The three-model breakdown is the common description; [7] itself lists the inputs: listening logs, other users' playlists, web text about music, and audio spectrograms.)* The reason for three separate models rather than one: collaborative filtering is powerful but blind for new or low-play-count tracks (there isn't enough co-listening data yet), so the NLP and audio-CNN signals exist specifically to cover that gap — a brand-new song can still be recommended on the strength of what it sounds like and what's being written about it, before enough people have streamed it for collaborative signals to kick in [7]. A related, separately documented system — BaRT (Bandits for Recommendations as Treatments), described in a 2018 Spotify Research paper — uses a multi-armed-bandit approach to decide which recommendation shelves and cards appear on the Home screen, balancing "show what we're confident you'll like" against "show something uncertain so we learn more" [20]. It is a distinct system from the three-model Discover Weekly blend above, but solves an adjacent problem with the same underlying data.
 
 Since 2019, Spotify has standardized model training and serving infrastructure on TensorFlow Extended (TFX) and Kubeflow Pipelines running on Kubernetes, after finding its earlier Scala-based tooling wasn't adopted by Python-centric ML engineers [9]. That platform reached alpha in August 2019 with about 100 users; early usage data showed some teams running roughly 7x more experiments than before, across some 18,000 pipeline runs [9] — evidence that the earlier friction (data scientists having to write Scala, or hand-maintain their own training infra) had been a real bottleneck on how much modeling work could even be tried.
 
@@ -424,20 +543,20 @@ Because ownership, docs links, and API references are declared data rather than 
 
 **What it is:** The system of pre-encoding audio into multiple bitrates, storing it as cacheable chunks, and serving it from CDN edge nodes close to the listener [8][11].
 
-**The problem it solved:** Before 2020, different Spotify squads independently picked CDN vendors and configurations (Akamai, AWS, or exposing Cloud Storage/S3 buckets directly), which meant no single team had visibility into the whole request path, and no consistent monitoring [8].
+**The problem it solved:** Audio streaming ran on a multi-CDN setup (Akamai and AWS, plus Fastly) that performed well, but CDN use for everything else (images, client updates) had fragmented: some squads served content straight from AWS S3 or Google Cloud Storage buckets, so no single team had visibility into the whole request path or consistent monitoring [8].
 
 **How it works inside:** Audio is pre-encoded at ingest time into several tiers, each aimed at a different network condition and subscription level [11]:
 
 | Tier | Bitrate | Codec | Available to |
 |---|---|---|---|
-| Low | ~24 kbps | Ogg Vorbis | Free, Premium |
-| Normal | ~96 kbps | Ogg Vorbis | Free, Premium |
-| High | ~160 kbps | Ogg Vorbis | Free, Premium |
-| Very High | ~320 kbps | Ogg Vorbis | Premium only |
+| Low | ~24 kbps | Not stated | Free, Premium |
+| Normal | ~96 kbps | Not stated | Free, Premium |
+| High | ~160 kbps | Not stated | Free, Premium |
+| Very High | ~320 kbps | Not stated | Premium only |
 | Lossless | up to 24-bit/44.1kHz | FLAC | Premium only |
 | Web player | 128 kbps / 256 kbps | AAC | Free / Premium |
 
-Because the file is pre-chunked, a client can issue an HTTP range request for just the next few seconds of audio rather than downloading a whole track, and a CDN edge node can cache and re-serve that chunk to the next nearby listener without going back to origin storage. Spotify consolidated this whole layer onto Fastly's edge cloud platform, whose routing and caching rules are written in VCL (Varnish Configuration Language), and built an internal self-service tool called **SquadCDN** on top of Fastly's own APIs [8]. SquadCDN gave any of the 80+ services and 60+ squads onboarded by February 2020 a governed path instead of ad hoc setup, providing:
+In a reference design where the file is pre-chunked (not described in [8] or [11]), a client can issue an HTTP range request for just the next few seconds of audio rather than downloading a whole track, and a CDN edge node can cache and re-serve that chunk to the next nearby listener without going back to origin storage. Spotify consolidated its non-audio CDN delivery onto Fastly's edge cloud platform (already used for audio), whose routing and caching rules are written in VCL (Varnish Configuration Language), and built an internal self-service tool called **SquadCDN** on top of Fastly's own APIs [8]. SquadCDN gave any of the 80+ services and 60+ squads onboarded by February 2020 a governed path instead of ad hoc setup, providing:
 
 - Self-service configuration through Fastly's APIs, without needing a central team to make every change.
 - Deployment reviews before a squad's CDN config change went live.
@@ -465,13 +584,13 @@ if (req.url ~ "^/api/personalized/") {
 
 **What it is:** The pipeline that carries "the user did X" facts from clients and services to storage and to the models that use them [4][5][6].
 
-**The problem it solved, round one (2013-2017):** Spotify ran its own Kafka (version 0.7) deployment across five datacenters, feeding Storm for real-time processing and Hadoop/HDFS for persistence, peaking at 700,000 events/sec and 3B+ events/day by January 2015 [6]. Kafka 0.7 had no broker-level replication, so HDFS was the only durability layer in the system — a known single point of failure the team had to design around with a custom cross-datacenter forwarding component ("Grouper") rather than fix at the source [6].
+**The problem it solved, round one (2013-2017):** Spotify ran its own Kafka (version 0.7) deployment across five datacenters, feeding Storm for real-time processing and Hadoop/HDFS for persistence, peaking at 700,000 events/sec and 3B+ events/day by January 2015 [6]. Kafka 0.7 had no broker-level replication, so HDFS was the only durability layer in the system — a known single point of failure the team accepted and designed around; separately, a custom "Grouper" component merged and compressed events so cross-datacenter links weren't saturated [6].
 
 **The problem it solved, round two (2017-2021):** Migrating to Google Cloud Pub/Sub in 2017 removed the self-hosted-Kafka operational burden and let throughput grow roughly 11x with much less added infra work [5][6]. But real gaps remained: mobile clients still sent events "fire-and-forget," meaning real data loss with no resend logic, and propagating a schema change could take hours [4]. The 2021 rebuild — which the team itself described as "changing the wheels on a moving bus" — added client-side resends with dedup identifiers, moved ETL fully onto Dataflow/Beam so it could auto-scale without a permanently running cluster, and migrated more than 600 live event types onto the new design without stopping the pipeline [4].
 
 > **Why this matters:** neither rewrite was "big-bang." Each was scoped to the specific failure mode the previous design couldn't handle (no replication → single point of failure; fire-and-forget → data loss), which is why the system could be replaced twice without an all-hands outage each time.
 
-**How it works inside today:** each of the 500+ event types gets its own Pub/Sub topic, its own ETL pipeline, and its own storage location, tagged with a priority tier [4]:
+**How it works inside today:** each of the 500+ event types gets its own Pub/Sub topic, its own ETL pipeline, and its own storage location, tagged with a priority tier [5]:
 
 ```mermaid
 stateDiagram-v2
@@ -500,7 +619,7 @@ priority:     "high"          # -> hours SLO
 payload:      { track_id, duration_ms, context }
 ```
 
-The stated design principle is "liveness over lateness": a noisy, broken, or blocked event type is allowed to fall behind without blocking any other event type's pipeline [4].
+The stated design principle is "liveness over lateness": a noisy, broken, or blocked event type is allowed to fall behind without blocking any other event type's pipeline [5].
 
 **What it costs:** isolating every event type into its own topic/pipeline/SLO means far more moving, independently-monitored pieces (per the 2019 numbers: ~2,500 VMs across ~15 microservices just for this system) than one shared pipeline would need [5].
 
@@ -510,7 +629,7 @@ The stated design principle is "liveness over lateness": a noisy, broken, or blo
 
 **The problem it solved:** Running data centers meant Spotify engineers spent time on hardware, networking, and capacity planning instead of the product; the company's own framing was blunt: "we are fundamentally in the music business and not to build data centers" [3].
 
-**How it worked:** the migration was split into two tracks. The **services track** moved microservices with a "lift and shift" approach — deploy as-is on Compute Engine/GKE, don't redesign, to avoid destabilizing live streaming — while the **data track** allowed teams more freedom to rewrite as they went [3][18]:
+**How it worked:** the migration was split into two tracks. The **services track** moved microservices with a "lift and shift" approach — deploy as-is on GCP, don't redesign, to avoid destabilizing live streaming — while the **data track** allowed teams more freedom to rewrite as they went [3][18]:
 
 | Layer | Before (self-hosted) | After (GCP) |
 |---|---|---|
@@ -580,14 +699,14 @@ flowchart TB
 
 **The problem it solved:** without a structured process, the same class of failure tends to recur, and nobody outside the responding team learns from it.
 
-**How it works inside:** teams score each incident on a 1-5 "preventability" rubric and track time-to-recovery [14]:
+**How it works inside:** in a 2021 study of Spotify for Artists incidents, the team scored each incident on a 1-5 "preventability" rubric and reconstructed its time-to-recovery [14]:
 
 | Score | Meaning |
 |---|---|
-| 1 | Nearly impossible to prevent (e.g. a novel upstream provider failure) |
-| 2-3 | Foreseeable with hindsight, but not by existing practice |
-| 3-4 | Involves a localized failure with known, well-understood preventative actions (most incidents fall here) |
-| 5 | Entirely foreseeable — a known risk that wasn't acted on |
+| 1 | "Almost impossible to prevent" |
+| 1-2 | Generally unclear or outside the team's control |
+| 3-4 | Localized failures preventable with known, well-understood actions (the study's headline: most incidents are technically preventable) |
+| 5 | "We saw this one coming and let it happen" (none in 2021) |
 
 One internal analysis (Spotify for Artists, 2021) found that incidents covered by synthetic (automated, proactive) tests recovered roughly **10x faster** than those without such coverage — a big enough gap that Spotify reprioritized investment toward synthetic testing as a result [14]. The same analysis found 55% of incidents consumed the better part of a responder's day, that 23% of incidents pulled in more than one responder, and that half of incidents had no recorded start/end timestamp at all — and when a timestamp *was* logged, 81% of the time it needed correcting by more than 5 minutes once the team reconstructed what actually happened. In other words, even measuring "how bad was this, and for how long" was itself an unsolved problem before the initiative [14].
 
@@ -618,7 +737,7 @@ Five scenarios below, roughly mapping to the classic failure categories (a data 
 
 #### A data center goes dark (Kafka era, pre-2017)
 
-During Spotify's self-hosted Kafka years, events were produced across five datacenters, but Kafka 0.7 had no built-in cross-datacenter replication. Spotify's answer was a custom component, nicknamed "Grouper," that compressed and batched events for forwarding between datacenters, so that losing connectivity to one site wouldn't mean losing that site's events outright — though HDFS remained the only true durability layer underneath all of it, a known single point of failure the team lived with rather than solved outright until the move to GCP [6]. This is a good illustration of a partial fix: Grouper addressed *getting data between* datacenters, but didn't remove the underlying fragility of depending on one persistence layer.
+During Spotify's self-hosted Kafka years, events were produced across five datacenters, but Kafka 0.7 had no built-in cross-datacenter replication. Spotify's answer was a custom component, nicknamed "Grouper," that merged, compressed, and batched events for forwarding between datacenters so raw Kafka streams wouldn't saturate cross-datacenter links — though HDFS remained the only true durability layer underneath all of it, a known single point of failure the team lived with rather than solved outright until the move to GCP [6]. This is a good illustration of a partial fix: Grouper addressed *getting data between* datacenters, but didn't remove the underlying fragility of depending on one persistence layer.
 *Design lesson: a workaround for one symptom (cross-datacenter forwarding) can coexist with an unresolved root cause (a single durability layer) for years, if the root fix is expensive enough.*
 
 #### A hot key overloads a few nodes (labeled reference design, not a documented Spotify incident)
@@ -627,7 +746,7 @@ During Spotify's self-hosted Kafka years, events were produced across five datac
 
 #### A shared low-level dependency fails silently (March 8, 2022)
 
-Google Cloud's Traffic Director — the service-discovery control plane some, but not all, of Spotify's services relied on — failed for about 2.5 hours. A separate, latent bug in the gRPC-Java client library meant clients using Traffic Director couldn't fall back cleanly, and users got logged out and couldn't log back in. The fix was to revert the affected systems to DNS-based service discovery, which Spotify already ran for most services, and recovery followed gradually as that config change rolled out [15]. The design choice that enabled recovery at all: Spotify hadn't put every service on Traffic Director — DNS-based discovery was still there as an escape hatch.
+Google Cloud's Traffic Director — the service-discovery control plane some, but not all, of Spotify's services relied on — had an outage. Combined with a bug in a gRPC client library, it meant users who got logged out couldn't log back in; Spotify's own outage ran from 18:12 to 20:35 UTC. The fix was to revert the affected systems to DNS-based service discovery, which Spotify already ran for most services, and recovery followed gradually as that config change rolled out [15]. The design choice that enabled recovery at all: Spotify hadn't put every service on Traffic Director — DNS-based discovery was still there as an escape hatch.
 *Design lesson: keep a second, simpler mechanism alive even after adopting a more sophisticated one — it becomes your fallback.*
 
 #### A shared low-level dependency fails silently, again but differently (January 14, 2023)
@@ -637,7 +756,7 @@ Routine maintenance on Spotify's internal GitHub Enterprise instance cascaded in
 
 #### A global rollout meets a resource limit under load (April 16, 2025)
 
-An Envoy proxy filter-order change was pushed to every region simultaneously, tripping a latent bug that crashed every Envoy instance worldwide within about two minutes. As clients retried their failed requests, the resulting traffic surge hit each restarting Envoy instance, whose configured heap size turned out to exceed its Kubernetes memory limit — so Kubernetes killed each new instance as it restarted, in a continuous crash-loop that client retries kept feeding. Recovery required increasing perimeter server capacity so instances could stay under the memory limit long enough to stabilize. Notably, the Asia Pacific region was unaffected, purely because it was in a low-traffic time zone at the moment of the change, so the extra retry load there never reached the same memory ceiling [17]. The design gap this exposed: an all-region-at-once rollout of a proxy config change, with no smaller blast radius to fail into first.
+An Envoy proxy filter-order change was pushed to every region simultaneously, tripping a latent bug that crashed every Envoy instance simultaneously. As clients retried their failed requests, the resulting traffic surge hit each restarting Envoy instance, whose configured heap size turned out to exceed its Kubernetes memory limit — so Kubernetes killed each new instance as it restarted, in a continuous crash-loop that client retries kept feeding. Recovery required increasing perimeter server capacity so instances could stay under the memory limit long enough to stabilize. Notably, the Asia Pacific region was unaffected, purely because it was in a low-traffic time zone at the moment of the change, so the extra retry load there never reached the same memory ceiling [17]. The design gap this exposed: an all-region-at-once rollout of a proxy config change, with no smaller blast radius to fail into first.
 *Design lesson: a config change is a deploy — it deserves the same staged, one-region-first rollout discipline as a code change, especially when client-side retries can turn a brief blip into a sustained traffic multiplier.*
 
 #### An event-type-level failure is contained by design (ongoing, event pipeline)
@@ -648,11 +767,11 @@ Side by side, the four failures above share one shape and differ in one detail �
 
 | Incident | Shared thing that broke | What made recovery possible |
 |---|---|---|
-| Kafka era (pre-2017) | HDFS as the only durability layer, across 5 datacenters | Grouper's cross-datacenter forwarding limited (didn't eliminate) the blast radius [6] |
+| Kafka era (pre-2017) | HDFS as the only durability layer, across 5 datacenters | Nothing structural; the team designed around HDFS until the move to GCP [6] |
 | March 2022 | GCP Traffic Director (service discovery) | A still-running DNS-based fallback path [15] |
 | January 2023 | Internal DNS resolvers' dependency on GitHub Enterprise | Manual mitigation once root cause was found; no automatic fallback existed [16] |
 | April 2025 | Envoy fleet-wide config + shared Kubernetes memory limit | Added perimeter capacity; no smaller rollout blast radius existed [17] |
-| Event pipeline (by design) | Nothing — each event type is isolated | Isolation was the design goal from the start, not a recovery step [4] |
+| Event pipeline (by design) | Nothing — each event type is isolated | Isolation was the design goal from the start, not a recovery step [5] |
 
 ```mermaid
 flowchart TB
@@ -682,19 +801,19 @@ Pulling together the trade-offs discussed throughout the deep dives and failure 
 | Build Backstage (internal developer portal + service catalog) | At thousands of services, engineers couldn't find owners, docs, or APIs; onboarding was slow [1][21] | Extra tooling investment; only pays off past a certain org/service count |
 | Move all 4 data centers to a single cloud provider (GCP) | Wanted to focus engineering on the music product, not data-center operations; avoided multi-cloud complexity [3] | Vendor lock-in to GCP; a GCP-side failure (Traffic Director, 2022) becomes a Spotify-side outage |
 | Replace self-hosted Kafka+Storm+Hadoop with Cloud Pub/Sub + Dataflow + BigQuery | Kafka 0.7 lacked broker replication, forcing HDFS as sole durability layer — a single point of failure; managed services supported ~11x throughput growth with much less added ops work [4][5][6] | Less low-level control than self-managed Kafka; dependent on GCP service SLAs |
-| Isolate each event type into its own topic/pipeline/SLO tier | A stuck or malformed event type shouldn't block delivery of the other 500+ types ("liveness over lateness") [4] | More moving pieces (one pipeline per event type) to operate and monitor |
-| Blend three independent recommendation models (collaborative filtering, NLP, audio CNN) rather than one model | Audio and NLP signals cover new/unpopular tracks that have too little collaborative (listening co-occurrence) data [7] | More models to maintain and combine; blending logic itself becomes a tuning problem |
+| Isolate each event type into its own topic/pipeline/SLO tier | A stuck or malformed event type shouldn't block delivery of the other 500+ types ("liveness over lateness") [5] | More moving pieces (one pipeline per event type) to operate and monitor |
+| Blend three kinds of signal (collaborative filtering, text, audio) rather than one *(model-level split is a reference design)* | Audio and NLP signals cover new/unpopular tracks that have too little collaborative (listening co-occurrence) data [7] | More models to maintain and combine; blending logic itself becomes a tuning problem |
 | Open-source Backstage early, then donate it to the CNCF | Spotify wanted outside contributions and adoption feedback rather than polishing internally first; ~40% of PRs came from outside Spotify soon after [1][12] | Slower internal-only iteration; the roadmap now has to serve a broader community, not just Spotify |
 | Keep DNS-based service discovery as a fallback path alongside Traffic Director | Gave the 2022 incident responders a way to recover by reverting to a simpler, already-proven mechanism [15] | Running two service-discovery mechanisms in parallel is itself added operational surface |
 | Emit playback events asynchronously, off the playback critical path | Analytics/recommendation pipeline degradation shouldn't stop a song from playing | Some risk of event loss if a client crashes before the event is flushed |
-| Score preventability (1-5) and time-to-recovery for every incident, and invest based on the data | Found that synthetic-test-covered incidents recovered ~10x faster, redirecting investment toward testing [14] | Running this scoring process is itself ongoing overhead on every incident response |
+| Score preventability (1-5) and time-to-recovery across a year of incidents (Spotify for Artists, 2021), and invest based on the data | Found that synthetic-test-covered incidents recovered ~10x faster, redirecting investment toward testing [14] | Running this scoring process is itself ongoing overhead on every incident response |
 | Organize engineers into autonomous squads/tribes, with chapters/guilds for cross-team alignment | Matches org structure to independently-owned microservices, so "who owns this" has one answer per service [19] | Autonomy without real chapter/guild investment tends toward duplicated effort and inconsistent practice [22] |
 
 ## Interview takeaways
 
 Patterns from this page worth having ready in a system design interview, and the question each answers:
 
-- **Isolate blast radius by partition key, not just by service.** Spotify's event pipeline gives every event *type* its own topic/pipeline/SLO rather than sharing one big pipeline — the reusable pattern for "how do you stop one bad tenant/feature from taking down everything else sharing infrastructure with it" [4].
+- **Isolate blast radius by partition key, not just by service.** Spotify's event pipeline gives every event *type* its own topic/pipeline/SLO rather than sharing one big pipeline — the reusable pattern for "how do you stop one bad tenant/feature from taking down everything else sharing infrastructure with it" [5].
 - **A service catalog is an org-scale problem, not a technical one.** Backstage exists because past a certain number of services and teams, "ask around" stops being a viable way to find an owner — a good answer to "how would you manage documentation/ownership at scale" [1][21].
 - **Migrate incrementally, scoped to the specific failure mode, not as a big-bang rewrite.** Spotify's event pipeline was rebuilt twice (2017, 2021), each time targeting one concrete gap (no replication; fire-and-forget data loss) rather than replacing everything at once — a strong answer to "how do you migrate a live system without an outage" [4][6].
 - **A fallback path only helps if it already existed before the incident.** The 2022 outage recovered specifically because DNS-based discovery was already running in parallel with Traffic Director — a reusable point for "design for graceful degradation" questions [15].
@@ -709,17 +828,19 @@ Patterns from this page worth having ready in a system design interview, and the
 
 Every term used above that isn't everyday English, in the order it's easiest to build on the last one:
 
-- **Microservice**: a small backend program that does one job (e.g. "manage playlists") and talks to other such programs over the network, instead of one giant program doing everything.
+New to these terms? The [concepts](../concepts/README.md) folder explains the core ideas in depth.
+
+- **[Microservice](../concepts/microservices.md)**: a small backend program that does one job (e.g. "manage playlists") and talks to other such programs over the network, instead of one giant program doing everything.
 - **Squad / tribe / chapter / guild**: Spotify's own names for its org structure — a squad is a small autonomous team owning a feature end to end; a tribe is a group of related squads; a chapter groups people with the same specialty across squads for management/mentoring; a guild is a voluntary, company-wide group around a shared interest.
 - **Developer portal / service catalog**: an internal website that lists every service a company runs, who owns it, and its docs, so engineers don't have to ask around to find things. Spotify's version is called Backstage.
 - **CNCF (Cloud Native Computing Foundation)**: a nonprofit that hosts and governs open-source infrastructure projects (like Kubernetes); Spotify donated Backstage to it in 2020.
-- **CDN (Content Delivery Network)**: a network of servers spread around the world that cache and serve files (like audio chunks) from a location close to the user, so downloads are fast.
+- **[CDN (Content Delivery Network)](../concepts/cdn.md)**: a network of servers spread around the world that cache and serve files (like audio chunks) from a location close to the user, so downloads are fast.
 - **Object storage**: a simple "store a file, get it back by name" storage service (e.g. Google Cloud Storage), as opposed to a database with rows/columns.
 - **Range request**: an HTTP request that asks for only part of a file (e.g. "give me bytes 1000-2000"), which lets a music player stream a track in small pieces instead of downloading it all first.
 - **Event**: a small record saying "this happened" (e.g. "user X played track Y at time Z"), sent from a client or service so it can be analyzed later.
 - **Event delivery pipeline**: the system that carries events from where they happen (a phone, a server) to where they're stored and processed.
-- **Kafka**: an open-source system for durably queuing streams of events between producers (things that create events) and consumers (things that process them).
-- **Google Cloud Pub/Sub**: Google's managed version of the same idea as Kafka — a message queue you don't have to run yourself.
+- **[Kafka](../concepts/message-queues-and-logs.md)**: an open-source system for durably queuing streams of events between producers (things that create events) and consumers (things that process them).
+- **[Google Cloud Pub/Sub](../concepts/message-queues-and-logs.md)**: Google's managed version of the same idea as Kafka — a message queue you don't have to run yourself.
 - **Dataflow / Apache Beam**: a framework and managed service for writing data-processing jobs (e.g. "read these events, dedupe them, write them to a warehouse") that can auto-scale without you managing servers.
 - **BigQuery**: Google's managed data warehouse — a database built for running big analytical queries over huge amounts of data.
 - **Bigtable**: Google's managed wide-column NoSQL database, good for very large, low-latency key-value-style lookups (used here to store precomputed recommendation data).
@@ -732,7 +853,7 @@ Every term used above that isn't everyday English, in the order it's easiest to 
 - **TensorFlow Extended (TFX)**: a set of tools built around Google's TensorFlow for building production ML pipelines (data validation, training, serving), not just training a model in a notebook.
 - **Kubeflow**: an open-source platform for running ML pipelines on Kubernetes.
 - **Kubernetes**: a system for automatically running, scaling, and restarting many containers (packaged programs) across a cluster of machines.
-- **Envoy**: a widely used open-source proxy that sits in front of backend services, handling traffic routing, retries, and load balancing.
+- **[Envoy](../concepts/load-balancing.md)**: a widely used open-source proxy that sits in front of backend services, handling traffic routing, retries, and load balancing.
 - **Service discovery**: the mechanism by which one service finds the network address of another service it needs to call — can be as simple as DNS or a dedicated control plane like Google's Traffic Director.
 - **xDS**: the family of discovery protocols (of which Traffic Director is one implementation) that tells proxies like Envoy which backend instances currently exist and are healthy.
 - **SLO (Service Level Objective)**: a target a team sets for how good a service should be (e.g. "99% of events delivered within 24 hours").

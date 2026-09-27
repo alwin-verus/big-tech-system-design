@@ -4,7 +4,7 @@
 
 ## In 60 seconds
 
-Slack splits its real-time layer into Channel Servers (hold the source of truth and recent history for a slice of channels, found via consistent hashing) and Gateway Servers (deployed at the edge, hold each client's WebSocket and channel subscriptions). A posted message flows client -> Webapp -> Admin Server -> the right Channel Server -> every subscribed Gateway Server -> client sockets, landing worldwide within ~500ms. Underneath, Slack ran MySQL sharded by workspace for years, then spent ~3 years migrating onto Vitess so it could reshard by *channel* instead, because a few huge customers each outgrew one shard's hardware. An edge cache called Flannel serves new/reconnecting clients a slimmed-down snapshot instead of a full reload, and a Kafka-backed job queue handles anything that shouldn't block a web request.
+Slack splits its real-time layer into Channel Servers (own a slice of channels and hold their recent history in memory, found via consistent hashing) and Gateway Servers (deployed at the edge, hold each client's WebSocket and channel subscriptions). A posted message flows client -> Webapp -> Admin Server -> the right Channel Server -> every subscribed Gateway Server -> client sockets, landing worldwide within ~500ms. Underneath, Slack ran MySQL sharded by workspace for years, then spent ~3 years migrating onto Vitess so it could reshard by *channel* instead, because a few huge customers each outgrew one shard's hardware. An edge cache called Flannel serves new/reconnecting clients a slimmed-down snapshot instead of a full reload, and a Kafka-backed job queue handles anything that shouldn't block a web request.
 
 ## The picture
 
@@ -29,14 +29,14 @@ Channel Servers only ever talk to Gateway Servers, never individual sockets — 
 | Metric | Number | Source |
 |---|---|---|
 | Peak Vitess query load | 2.3 million QPS (2M reads + 300K writes) | [Slack Engineering](https://slack.engineering/scaling-datastores-at-slack-with-vitess/) |
-| Largest documented single workspace | 160,000 active users, 5,000+ shared channels (2019) | [Slack Engineering](https://slack.engineering/how-slack-built-shared-channels/) |
+| Largest documented customers | 160,000+ active users, 5,000+ shared channels (2019) | [Slack Engineering](https://slack.engineering/how-slack-built-shared-channels/) |
 | Vitess median / p99 latency | 2ms / 11ms | [Slack Engineering](https://slack.engineering/scaling-datastores-at-slack-with-vitess/) |
 | Job queue volume | 1.4 billion jobs/day, peak 33,000/sec | [Slack Engineering](https://slack.engineering/scaling-slacks-job-queue/) |
 | Flannel peak connections | 4 million simultaneous | [Slack Engineering](https://slack.engineering/flannel-an-application-level-edge-cache-to-make-slack-scale/) |
 | Flannel data-size reduction | 7x (1.5K-user team) to 44x (32K-user team) | [Slack Engineering](https://slack.engineering/flannel-an-application-level-edge-cache-to-make-slack-scale/) |
 | Channel Server failover time | new host serving in under 20 seconds | [Slack Engineering](https://slack.engineering/real-time-messaging/) |
 | Global message delivery latency | worldwide within 500ms | [Slack Engineering](https://slack.engineering/real-time-messaging/) |
-| Jan 4, 2021 outage duration | ~5 hours | [Slack Engineering](https://slack.engineering/slacks-outage-on-january-4th-2021/) |
+| Jan 4, 2021 outage duration | ~4 hours (6:57–10:40 AM PST) | [Slack Engineering](https://slack.engineering/slacks-outage-on-january-4th-2021/) |
 
 ## Signature ideas
 

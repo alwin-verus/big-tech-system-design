@@ -9,6 +9,7 @@
 - [Before you read: design it yourself](#before-you-read-design-it-yourself)
 - [The problem](#the-problem)
 - [Scale](#scale)
+- [Back-of-the-envelope math](#back-of-the-envelope-math)
 - [Requirements](#requirements)
 - [How it evolved](#how-it-evolved)
 - [High-level design](#high-level-design)
@@ -51,6 +52,10 @@ Open with a story: one real user action (e.g. "You tap *Request* in Lagos at 6pm
 | e.g. Daily active users | ~X M (year) | [1](#sources) |
 
 Only numbers a source states. No guesses. Follow the table with 2–3 sentences on what the numbers *mean* (e.g. "that's N requests every second, more than one server could ever handle").
+
+## Back-of-the-envelope math
+
+3–5 worked whiteboard estimates (requests per second, storage per day, bandwidth). Each: **Question**, **Inputs** (sourced numbers cite [n]; everything else prefixed "Assumption:"), **Math** in a `text` code block with units, **Answer**, **What it tells you**. End with a "Rules of thumb used" table.
 
 ## Requirements
 

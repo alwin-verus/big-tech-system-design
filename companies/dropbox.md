@@ -9,6 +9,7 @@
 - [Before you read: design it yourself](#before-you-read-design-it-yourself)
 - [The problem](#the-problem)
 - [Scale](#scale)
+- [Back-of-the-envelope math](#back-of-the-envelope-math)
 - [Requirements](#requirements)
 - [How it evolved](#how-it-evolved)
 - [High-level design](#high-level-design)
@@ -72,7 +73,7 @@ If nothing goes looking for a problem, how would you ever find out before a cust
 <details>
 <summary>How Dropbox does it</summary>
 
-Pocket Watch runs three always-on verifiers: the Disk Scrubber (re-reads every bit against checksums every 1-2 weeks), the Metadata Scanner (cross-checks the Block Index against real placement at ~1M blocks/sec), and the Storage Watcher (samples ~1% of writes for up to a month after they land). Together these are why Magic Pocket's theoretical durability target reaches "27 nines" — a number about how unlikely undetected data loss becomes, not a claim about any one disk. Dropbox doesn't just trust the verifiers work — engineers deliberately corrupt test data on purpose to confirm each one actually catches it. Trade-off: verification isn't a background afterthought, it's over half of all disk and database load in the entire system — a large, permanent tax paid continuously whether or not anything is actually broken.
+Pocket Watch runs three always-on verifiers: the Disk Scrubber (re-reads every bit against checksums every 1-2 weeks), the Metadata Scanner (cross-checks the Block Index against real placement at ~1M blocks/sec), and the Storage Watcher (samples ~1% of writes for up to a month after they land). Dropbox's Markov-model durability estimate, given worst-case disk failure rates and repair times, is "27 nines" — a modeled number about how unlikely data loss becomes, not a claim about any one disk. Dropbox doesn't just trust the verifiers work — engineers deliberately corrupt test data on purpose to confirm each one actually catches it. Trade-off: verification isn't a background afterthought, it's over half of all disk and database load in the entire system — a large, permanent tax paid continuously whether or not anything is actually broken.
 
 Deep dive: [Pocket Watch: continuous verification](#pocket-watch-continuous-verification)
 
@@ -90,7 +91,7 @@ Most access to your own stuff is "local" — can you exploit that to make the co
 <details>
 <summary>How Dropbox does it</summary>
 
-Edgestore introduces colos — placing data that's usually read and written together (a user's own files and folders) on the same physical MySQL shard, giving cheap strong consistency for the common case by construction. The rarer cross-shard operations (5-10% of traffic) go through a modified two-phase commit with copy-on-write staging, cutting write amplification by up to 95% versus duplicating the whole object. As Edgestore's own "split the whole fleet to add capacity" model hit its own ceiling, Dropbox built Alki (cold data moved to a cheap DynamoDB+S3 tier) and Panda (incremental, small-range rebalancing) underneath it. Trade-off: strong consistency by default means every write invalidates caches, and running three overlapping metadata systems during the transition is itself an ongoing operational cost.
+Edgestore introduces colos — placing data that's usually read and written together (a user's own files and folders) on the same physical MySQL shard, giving cheap strong consistency for the common case by construction. The rarer cross-shard operations (5-10% of transactions) go through a modified two-phase commit with copy-on-write staging, cutting write amplification by up to 95% versus duplicating the whole object. As Edgestore's own "split the whole fleet to add capacity" model hit its own ceiling, Dropbox built Alki (cold data moved to a cheap DynamoDB+S3 tier) and Panda (incremental, small-range rebalancing) underneath it. Trade-off: strong consistency by default means every write invalidates caches, and running three overlapping metadata systems during the transition is itself an ongoing operational cost.
 
 Deep dive: [Edgestore](#edgestore)
 
@@ -113,12 +114,12 @@ This page is organized in roughly the order those questions get answered as a fi
 | Magic Pocket storage drives (2023) | 600,000+ | [15](#sources)[16](#sources) |
 | Magic Pocket request throughput (2023) | tens of millions of requests/sec | [15](#sources)[16](#sources) |
 | Magic Pocket annual durability | over 12 nines (2023); stated as >99.9999999999% (2016) | [16](#sources)[3](#sources) |
-| Magic Pocket theoretical durability (verification design target) | "27 nines" (≈99.9999999999999999999999999%) | [2](#sources) |
+| Magic Pocket theoretical durability (Markov-model estimate from worst-case disk failure and repair rates) | "27 nines" (≈99.9999999999999999999999999%) | [2](#sources) |
 | Magic Pocket availability | 99.99% across 3 North American regions (2023); stated as >99.99% (2016) | [16](#sources)[3](#sources) |
 | Magic Pocket repair throughput | 4 extents/sec repaired (1–2GB each), repair SLA under 48 hours (2023) | [16](#sources) |
 | Magic Pocket verification workload share | verification is >50% of all disk and database load (2016) | [2](#sources) |
 | Edgestore (2016) | several trillion entries stored, millions of queries/sec, "five nines" availability | [9](#sources) |
-| Edgestore total throughput (2018) | ~10 million requests/sec (cross-shard transactions are 5–10% of that) | [10](#sources) |
+| Edgestore total throughput (2018) | ~10 million requests/sec (cross-shard transactions are 5–10% of Edgestore transactions) | [10](#sources) |
 | Panda / Filesystem+Edgestore combined (2022) | tens of millions of queries/sec, single-digit ms latency target | [11](#sources) |
 | Alki cold-metadata tier (2020) | ~350TB stored at about 1/6 Edgestore's cost per GB/year | [13](#sources) |
 | Nucleus rewrite duration | ~4-year project (started 2016, shipped to all users March 2020) | [6](#sources) |
@@ -127,6 +128,131 @@ This page is organized in roughly the order those questions get answered as a fi
 | Data-center blackhole test (Nov 2021) | 30-minute full outage of the SJC metro, zero global-availability impact | [14](#sources) |
 
 Tens of millions of requests a second against a fleet of 600,000+ disks means Magic Pocket cannot treat "a disk died" as an emergency — it has to be background noise the system absorbs automatically. Losing several fragments out of an erasure-coded group and still reading the file back correctly is precisely what turns hundreds of thousands of individually unreliable disks into something more durable than any single disk could ever be on its own. And the jump from "rewrite the sync engine over four years" to "unplug an entire data center on purpose to prove failover works" shows the same instinct repeated at every layer of this stack: assume failure is constant and design so that it's boring when it happens.
+
+## Back-of-the-envelope math
+
+Back-of-the-envelope math is the rough, order-of-magnitude arithmetic engineers do on a whiteboard to size a system before building it — not a precise forecast. Inputs marked with a [n] reference are pulled straight from this page's Scale table; everything else is a labeled `Assumption:` used purely for illustration.
+
+### Storage growth rate during the Magic Pocket migration
+
+**Question:** How much new data per day did Dropbox need to absorb while moving off S3?
+
+**Inputs:**
+- User data in-house: grew from 40PB (2012) to 500+PB by Oct 2015 [3](#sources)
+- Assumption: treat the span as ~3.5 years (2012 to Oct 2015)
+
+**Math:**
+```text
+growth      = 500 PB - 40 PB
+            = 460 PB
+
+days        = 3.5 years * 365 days/year
+            ≈ 1,278 days
+
+per_day     = 460 PB / 1,278 days
+            ≈ 0.36 PB/day
+            ≈ 360 TB/day
+
+per_sec     = 360,000 GB / 86,400 sec
+            ≈ 4.17 GB/sec
+```
+
+**Answer:** ~360 TB/day (~4.2 GB/s sustained) average growth over that window.
+
+**What it tells you:** absorbing several hundred TB of new data every single day, indefinitely, needs constant fleet expansion rather than a fixed-size cluster — why Magic Pocket's drive count is in the hundreds of thousands. See [Magic Pocket](#magic-pocket).
+
+### Blocks without dedupe, cross-checked against Edgestore's entry count
+
+**Question:** How many blocks would exist with no deduplication at all — and does that line up with Edgestore's own numbers?
+
+**Inputs:**
+- Content-hash block size: 4MB [12](#sources) (using decimal MB = 10^6 bytes for round math; the source's exact figure is 4,194,304 bytes)
+- Registered users: ~700M (2021) [21](#sources) *(third-party)*
+- Assumption: average account holds ~10GB of unique file data
+
+**Math:**
+```text
+blocks_per_account    = 10,000 MB / 4 MB
+                       = 2,500 blocks
+
+total_blocks_no_dedupe = 700,000,000 accounts * 2,500 blocks
+                       = 1,750,000,000,000
+                       ≈ 1.75 trillion blocks
+```
+
+**Answer:** ~1.75 trillion blocks if nothing were ever deduplicated.
+
+**What it tells you:** Edgestore is independently reported at "several trillion entries" [9](#sources) — the same order of magnitude as this estimate, consistent with roughly one metadata entry per block/file-reference rather than per raw byte, and showing why [block hashing and dedupe](#block-hashing-and-dedupe) is foundational at this scale, not an optimization.
+
+### Repair throughput vs. steady-state disk failures
+
+**Question:** Does Magic Pocket's stated repair throughput actually keep up with ordinary disk failures across 600,000+ drives?
+
+**Inputs:**
+- Magic Pocket storage drives (2023): 600,000+ [15](#sources), [16](#sources)
+- OSD capacity: ~100 disks, 2PB+ per OSD [16](#sources) → ~20TB average capacity per disk
+- Repair throughput: 4 extents/sec repaired, 1-2GB each, repair SLA <48h (2023) [16](#sources)
+- Assumption: annual drive failure rate (AFR) ≈ 1.5%/year (typical published datacenter HDD AFR)
+- Assumption: extent size used in the math = 1.5GB (midpoint of the stated 1-2GB range)
+
+**Math:**
+```text
+drives_failing_per_year = 600,000 * 0.015
+                         = 9,000 drives/year
+
+drives_failing_per_day  = 9,000 / 365
+                         ≈ 24.66 drives/day
+
+data_to_rebuild_per_day = 24.66 drives * 20 TB/drive
+                         ≈ 493 TB/day
+
+repair_throughput       = 4 extents/sec * 1.5 GB/extent
+                         = 6 GB/sec
+
+repair_throughput_per_day = 6 GB/sec * 86,400 sec/day
+                         = 518,400 GB/day
+                         ≈ 518 TB/day
+
+headroom                = 518 / 493
+                         ≈ 1.05x  (~5% headroom)
+```
+
+**Answer:** ~493 TB/day needs reconstructing from ordinary disk churn alone, against ~518 TB/day of stated repair capacity — only ~5% headroom.
+
+**What it tells you:** the 48-hour SLA isn't generous slack, it's close to the physical limit of routine rebuild speed — which is why erasure coding's redundancy margin, not repair speed, is what has to absorb a correlated event like a whole rack or the blackhole-tested SJC metro. See [Magic Pocket](#magic-pocket).
+
+### Edgestore-to-Panda QPS growth multiple
+
+**Question:** How much did total metadata query throughput grow between Edgestore's 2018 figure and Panda's 2022 figure?
+
+**Inputs:**
+- Edgestore total throughput (2018): ~10 million requests/sec [10](#sources)
+- Panda/Filesystem+Edgestore combined (2022): tens of millions of queries/sec [11](#sources)
+- Assumption: read "tens of millions" at its lowest plausible reading, ~20M/sec
+
+**Math:**
+```text
+growth_multiple = 20,000,000 / 10,000,000
+                 = 2x over 4 years (2018 -> 2022)
+
+annualized_rate = 2^(1/4)
+                 ≈ 1.19
+                 ≈ 19%/year compounding (minimum)
+```
+
+**Answer:** at least ~2x total metadata QPS growth in 4 years (≈19%/year compounding, at minimum — "tens of millions" could read considerably higher).
+
+**What it tells you:** this sets a floor on how much headroom the Panda rewrite needed over Edgestore's original design, consistent with the page's framing of Panda as generalizing Edgestore's scaling model rather than just patching it. See [Panda and Alki: Edgestore's successors](#panda-and-alki-edgestores-successors).
+
+### Rules of thumb used
+
+| Rule of thumb | Value |
+|---|---|
+| 1 day | ~86,400 s ≈ 10^5 s |
+| 1 year | ~365 days |
+| Byte units | 1 KB/MB/GB/TB/PB = 10^3/10^6/10^9/10^12/10^15 bytes (decimal, not binary) |
+
+These are general estimation conventions, not Dropbox-specific facts.
 
 ## Requirements
 
@@ -166,7 +292,7 @@ timeline
 
 Every stage here is a direct response to something breaking, or becoming too expensive, at the previous scale — that throughline carries through the rest of this page. Dropbox started, like most companies, on someone else's infrastructure: AWS S3 for bytes, one MySQL database (then several sharded ones) for metadata, and a Python sync engine talking to SQLite locally [1](#sources)[9](#sources)[6](#sources). Each of the four systems this page focuses on exists because that starting point stopped working:
 
-- **Storage** got too expensive and inflexible for Dropbox's specific access pattern (huge counts of small, immutable blocks) once Dropbox was operating at tens of petabytes, so it built Magic Pocket and spent 2014–2015 quietly migrating 90% of user data off S3 [3](#sources). The payoff kept compounding after the initial migration: custom Diskotech hardware and early SMR-disk adoption (2015) squeezed more density out of the same racks, and the Pocket Watch verification stack turned a one-time storage migration into an ongoing, continuously-checked durability guarantee rather than a static architecture decision [2](#sources)[18](#sources).
+- **Storage** got too expensive and inflexible for Dropbox's specific access pattern (huge counts of small, immutable blocks) once Dropbox was operating at tens of petabytes, so it built Magic Pocket and spent 2014–2015 quietly migrating 90% of user data off S3 [3](#sources). The payoff kept compounding after the initial migration: custom Diskotech hardware (project started 2015) and later SMR-disk adoption (~40% of data on SMR by end of 2019) squeezed more density out of the same racks, and the Pocket Watch verification stack turned a one-time storage migration into an ongoing, continuously-checked durability guarantee rather than a static architecture decision [2](#sources)[18](#sources).
 - **Metadata** outgrew what hand-managed MySQL shards could do operationally, so Dropbox built Edgestore starting in late 2012, and later Panda (2022) and Alki (2020) as Edgestore itself started hitting its own scaling wall [9](#sources)[11](#sources)[13](#sources). Notably, Edgestore didn't fail outright — its colo-based sharding and cross-shard 2PC kept working fine architecturally — it simply ran into the same "double the whole fleet to add capacity" ceiling that MySQL sharding had before it, one layer up the stack.
 - **Sync** accumulated structural, un-patchable bugs in its data model and concurrency design, so Dropbox spent four years (2016–2020) building Nucleus from scratch in Rust rather than continuing to patch the Python engine [6](#sources). Getting there required inventing new testing infrastructure (CanopyCheck, Trinity) alongside the rewrite itself, because the old engine's bugs were exactly the kind that hand-written test cases tend to miss.
 - **Confidence** that all of this actually survives a real failure had to be earned separately — hence years of increasingly aggressive disaster-readiness testing, culminating in physically unplugging a whole metro's data centers in 2021 [14](#sources). This one didn't start as a success either: an earlier rehearsal at a different metro failed within four minutes over an undocumented dependency nobody had mapped, which is precisely the kind of thing a rehearsal is supposed to surface before it happens for real.
@@ -200,7 +326,7 @@ Walking through it:
 3. **Before uploading anything, the client checks what's already known.** Nucleus splits the changed file into 4MB blocks, hashes each with SHA-256, and only the blocks the server doesn't already have for that account get uploaded [12](#sources)[8](#sources). This check happens *before* any bytes move specifically because the alternative — upload first, dedupe server-side afterward — would still cost the full upload bandwidth for data that turns out to be a duplicate; asking first is what makes the dedupe savings real instead of just a storage-side optimization. This dedupe step is covered in full in the [Deep dives](#deep-dives).
 4. **New blocks land in Magic Pocket, not raw disk.** The block server groups incoming blocks into 1–2GB **buckets** (also called volumes), which live inside a **storage cell** — an independent, self-contained slice of the overall fleet, run by a cell coordinator that health-checks its own OSDs and schedules erasure coding and repairs [1](#sources)[16](#sources). Grouping blocks into large volumes rather than treating each 4MB block as its own standalone object matters because managing per-block metadata (placement, replication state, repair status) for hundreds of billions of individual blocks would itself be a metadata-scale problem; a volume is the unit small enough to fit in memory-sized indexes but large enough that Magic Pocket handles a manageable number of them.
 5. **Once a bucket fills up, it's closed and erasure-coded — permanently.** A closed volume is never reopened for writes; a background job erasure-codes it into data and parity fragments spread across many OSDs (object storage devices, i.e. individual storage machines) [16](#sources). Erasure coding only happens *after* a volume closes, not while it's still accepting writes, because the coding scheme needs to see the volume's final contents to split it into a fixed set of fragments — trying to erasure-code a volume that's still changing would mean constantly re-encoding it, which defeats the storage savings.
-6. **Other devices on the same account get told, not asked.** Edgestore pushes a change notification so other clients know to pull the new metadata down, and then the new blocks if they need them [9](#sources). Pushing a lightweight notification rather than having every idle device poll the server on a timer is what keeps millions of idle desktop clients from generating meaningful load just by sitting open and doing nothing.
+6. **Other devices on the same account get told, not asked.** A change notification is pushed so other clients know to pull the new metadata down, and then the new blocks if they need them (reference design; the notification mechanism is not described in the cited sources). Pushing a lightweight notification rather than having every idle device poll the server on a timer is what keeps millions of idle desktop clients from generating meaningful load just by sitting open and doing nothing.
 
 ## Low-level design
 
@@ -374,7 +500,7 @@ The metadata-model diagram in section 2 above is deliberately simplified to look
 
 Because a huge fraction of the system's entire purpose is "notice quiet corruption before it becomes unrecoverable," Dropbox runs a whole second stack of continuous verification nicknamed **Pocket Watch** — its own deep dive below — that together accounts for over half of all disk and database load in Magic Pocket [2](#sources). When something does fail, the system must "repair 4 extents every second" and holds itself to a strict repair SLA of under 48 hours, rebuilding a lost fragment either as part of a live read request or as a lower-priority background job [16](#sources).
 
-**Capacity planning is its own ongoing engineering problem, not a one-time decision.** New OSDs are allocated into cells automatically based on the cell's current size, utilization, and available data-center space, but at Dropbox's growth rate — "double digits per year," meaning total system capacity roughly doubles every three to four years [16](#sources) — capacity has to be forecast well ahead of need. A control plane consumes that forecast and generates migration schedules that move data between cells and regions without competing with live customer traffic: background migration work is deliberately given lower priority than live requests, and the system will selectively throttle or drop it under load rather than let it degrade user-facing latency [16](#sources). This isn't always smooth in practice — the 2023 QCon Plus talk describes a real migration of hundreds of petabytes into the SJC region that initially underperformed its own throughput projections, needed active optimization to speed up, and still left "a really long tail end" that required extended planning cycles to finish [16](#sources).
+**Capacity planning is its own ongoing engineering problem, not a one-time decision.** New OSDs are allocated into cells automatically based on the cell's current size, utilization, and available data-center space, but at Dropbox's growth rate — "double digits per year" [16](#sources) — capacity has to be forecast well ahead of need. A control plane consumes that forecast and generates migration schedules that move data between cells and regions without competing with live customer traffic: background migration work is deliberately given lower priority than live requests, and the system will selectively throttle or drop it under load rather than let it degrade user-facing latency [16](#sources). This isn't always smooth in practice — the 2023 QCon Plus talk describes a real migration of hundreds of petabytes into the SJC region that initially underperformed its own throughput projections, needed active optimization to speed up, and still left "a really long tail end" that required extended planning cycles to finish [16](#sources).
 
 **What it costs:** years of engineering investment before the first byte of user data ever moved off S3; Dropbox now owns the operational burden (and blast radius) of running its own data-center hardware instead of renting someone else's; erasure coding and its rebuild math are meaningfully more complex to reason about and debug than "read any of three replicas"; and the whole system ships changes cautiously — a four-week release process (unit and integration testing, then a full week of durability staging per zone, then automated rollout gated on alerts) before a change reaches production [16](#sources).
 
@@ -407,7 +533,7 @@ Local Reconstruction Codes push the overhead down further by adding a second, sm
 
 **How it works inside:** Pocket Watch runs three distinct verifiers, each catching a different failure shape. The **Disk Scrubber** re-reads every single bit on every disk in the fleet against its stored checksum on a 1–2 week cycle, catching slow bit rot before it accumulates past what erasure coding can fix. The **Metadata Scanner** cross-checks the Block Index (which says what should be where) against what's actually placed on OSDs, at roughly a million blocks a second, catching the case where the index and the physical fleet have quietly drifted out of agreement. The **Storage Watcher** does black-box sampling — reading back a small fraction (~1%) of writes over windows ranging from a minute to a month after they land — catching problems that appear shortly after a write rather than only showing up years into a block's life [2](#sources).
 
-Together, these three verifiers are why Magic Pocket's stated theoretical durability target reaches "27 nines" [2](#sources) — a number describing how unlikely undetected, unrepaired data loss becomes when this much of the fleet is continuously re-checked, not a claim about any single disk's own reliability. Dropbox doesn't only trust that these detectors work in theory, either: engineers have described deliberately corrupting test data on purpose specifically to confirm each verifier actually catches it, on the reasoning that a verifier that has never fired might just as easily be a verifier that's silently broken [17](#sources).
+Dropbox's stated theoretical durability, computed with a Markov model from worst-case disk failure rates and repair times, is "27 nines" [2](#sources) — a number that only holds if failures are detected and repaired quickly, which is what these verifiers are for, not a claim about any single disk's own reliability. Dropbox doesn't only trust that these detectors work in theory, either: engineers have described deliberately corrupting test data on purpose specifically to confirm each verifier actually catches it, on the reasoning that a verifier that has never fired might just as easily be a verifier that's silently broken [17](#sources).
 
 **What it costs:** verification is not a background afterthought — it is, by Dropbox's own account, over half of all disk and database load in the entire Magic Pocket system [2](#sources). That's a deliberate trade: a large, permanent, ongoing tax on I/O capacity and database throughput, paid continuously, in exchange for catching corruption long before it becomes unrecoverable data loss.
 
@@ -416,13 +542,13 @@ Together, these three verifiers are why Magic Pocket's stated theoretical durabi
 - Disk Scrubber cycle: every disk fully re-read against checksums every 1–2 weeks [2](#sources)
 - Metadata Scanner throughput: ~1 million blocks/sec cross-checked against physical placement [2](#sources)
 - Storage Watcher samples ~1% of writes, over windows from one minute to one month [2](#sources)
-- Theoretical verification durability target: "27 nines" (2016) [2](#sources)
+- Markov-model theoretical durability: "27 nines" (2016) [2](#sources)
 
 > **Why this matters:** a system's stated durability number is only as trustworthy as the verification behind it. Claiming "12 nines" or "27 nines" of durability without something continuously and independently re-checking the fleet for silent corruption would just be an unverified number on a slide — Pocket Watch is what makes that number something Dropbox can actually stand behind.
 
 ### Diskotech and custom storage hardware
 
-**What it is:** Diskotech is the codename for Dropbox's in-house storage-server hardware program, rolled out alongside Magic Pocket's 2015 production launch, paired with one of the earliest major-company adoptions of host-managed **SMR (shingled magnetic recording)** disks [3](#sources)[4](#sources)[18](#sources)[19](#sources).
+**What it is:** Diskotech is the codename for Dropbox's in-house storage-server hardware program, a project started in 2015 [19](#sources), later paired with an early major-company adoption of host-managed **SMR (shingled magnetic recording)** disks, which Dropbox began pursuing shortly after Magic Pocket went live (~40% of data on SMR by end of 2019) [4](#sources)[18](#sources).
 
 **The problem it solved:** off-the-shelf storage servers and enterprise drives are built and priced for a broad range of access patterns — mixed random reads and writes, unpredictable hot/cold data. Magic Pocket's actual workload is far narrower: enormous numbers of small blocks, written once, closed, and then read only occasionally for years afterward. Renting or buying general-purpose gear tuned for a much wider workload than Magic Pocket actually has leaves both density and cost on the table [4](#sources)[19](#sources).
 
@@ -442,7 +568,7 @@ Together, these three verifiers are why Magic Pocket's stated theoretical durabi
 **What it costs:** owning hardware design means owning qualification, firmware quirks, and supply-chain risk that renting from a cloud vendor would otherwise absorb. SMR's sequential-write constraint has to be respected everywhere in the software stack — it's a large part of *why* "a volume is never reopened" is a hard architectural rule in Magic Pocket rather than just a simplification. And any density or cost win has to be re-earned with each new drive generation, as densities, firmware behavior, and failure modes shift [18](#sources)[19](#sources).
 
 **Numbers that matter:**
-- Diskotech hardware and host-managed SMR adoption both trace to Magic Pocket's 2015 production launch window [3](#sources)[18](#sources)
+- Diskotech project started in 2015 [19](#sources); host-managed SMR adoption followed after Magic Pocket went live, reaching ~40% of all data by end of 2019 [18](#sources)
 - SMR's density gain comes specifically from overlapping write tracks — the same physical mechanism that forces sequential, zone-based writes rather than in-place random overwrites [19](#sources)
 
 > **Why this matters:** software and hardware decisions reinforce each other here. Erasure coding needs closed, immutable volumes to be safe to encode; immutable, sequentially-written volumes are exactly what let Dropbox exploit cheap, dense SMR disks instead of paying for drives built for random-write performance it structurally doesn't need. Neither decision would pay off as well without the other.
@@ -512,7 +638,7 @@ Worked example: a 10MB file splits into three blocks — two full 4MB blocks and
 
 **The problem it solved:** Dropbox originally ran multiple independent, hand-managed MySQL databases; as some of those databases grew too large for one machine, they were split into shards, and this created a growing operational burden along with awkward performance-isolation problems between unrelated features sharing infrastructure [9](#sources). Edgestore's job was to abstract that away entirely, so application teams could get a graph-like data model with strong consistency without hand-rolling sharding and caching themselves.
 
-**How it works inside:** Edgestore introduces **colos** — a hint that two pieces of data (say, a user's own files and folders) are typically read and written together, so Edgestore physically places them on the same MySQL shard, giving cheap strong consistency for the common case by construction [9](#sources). For the roughly 5–10% of operations that genuinely need to touch data on two different shards at once — say, an association between two users on different shards — Edgestore implements a modified **two-phase commit (2PC)** with four phases (a durable transaction record, participants staging their intent to commit, a leader recording the final decision, then participants applying it) and a **copy-on-write staging** trick that stores only the pending mutation rather than a full duplicate of the object being changed, cutting write amplification by up to 95% versus the naive approach [10](#sources).
+**How it works inside:** Edgestore introduces **colos** — a hint that two pieces of data (say, a user's own files and folders) are typically read and written together, so Edgestore physically places them on the same MySQL shard, giving cheap strong consistency for the common case by construction [10](#sources). For the roughly 5–10% of operations that genuinely need to touch data on two different shards at once — say, an association between two users on different shards — Edgestore implements a modified **two-phase commit (2PC)** with four phases (a durable transaction record, participants staging their intent to commit, a leader recording the final decision, then participants applying it) and a **copy-on-write staging** trick that stores only the pending mutation rather than a full duplicate of the object being changed, cutting write amplification by up to 95% versus the naive approach [10](#sources).
 
 ```mermaid
 sequenceDiagram
@@ -540,7 +666,7 @@ Copy-on-write staging is the detail that keeps this affordable: instead of dupli
 
 **Numbers that matter:**
 - Edgestore (2016): several trillion entries, millions of queries/sec, "five nines" availability, running on thousands of machines across multiple data centers [9](#sources)
-- Edgestore (2018): ~10 million requests/sec total; cross-shard transactions are only 5–10% of that, and copy-on-write staging cuts their write amplification by up to 95% [10](#sources)
+- Edgestore (2018): ~10 million requests/sec total; cross-shard transactions are only 5–10% of Edgestore transactions, and copy-on-write staging cuts their write amplification by up to 95% [10](#sources)
 
 > **Why this matters:** the colo concept is a bet that most metadata access is "local" (your own files and folders) and only a minority is "social" (sharing across accounts), so the system optimizes the common case for free strong consistency and only pays the expensive 2PC tax on the rare cross-shard path.
 
@@ -611,7 +737,7 @@ The broader lesson Dropbox drew was architectural as much as operational: some s
 | Custom Diskotech hardware + host-managed SMR disks | Matching software and hardware density directly cuts cost per byte further than software-only changes could, because general-purpose servers reserve capability (like random-write performance) Magic Pocket's access pattern never uses [4](#sources)[18](#sources) | Dropbox now owns hardware qualification, firmware quirks, and supply-chain risk directly, all things a cloud vendor would otherwise absorb on Dropbox's behalf, and every new drive generation has to re-earn its density and cost advantage from scratch as failure modes shift. |
 | Fixed 4MB blocks, not content-defined chunking | Simple and fully deterministic — every client computes the identical `content_hash` the identical way with no ambiguity about where a block boundary falls [12](#sources) | An insert of even a few bytes near the start of a large file shifts every later block boundary, so every hash after that point changes and dedupe against the previous version of the file silently stops working until the whole file is re-chunked and re-uploaded from that point on. |
 | Rewrite the sync engine from scratch in Rust (Nucleus) instead of patching the Python engine | The old engine's core bugs (weak move semantics, thread/lock races) were structural properties of its data model, not isolated bugs, so no amount of incremental patching could fix them; Rust's type system lets sync invariants be encoded and checked at compile time instead [6](#sources) | This was a multi-year, high-risk project that required keeping the old engine fully supported the entire time it ran in parallel, and it also required designing and shipping an entirely new client-server protocol alongside the new client, roughly doubling the surface area that had to be gotten right before anything could ship. |
-| Edgestore's colo-based sharding over plain horizontal MySQL sharding | Data usually read and written together (a user's own files and folders) is deliberately placed on one shard, so the common case gets cheap strong consistency for free, without any cross-machine coordination [9](#sources) | Anything that legitimately needs to touch two different shards at once — like sharing a file with a user who happens to live on a different shard — falls onto the slower, more complex cross-shard transaction path instead of a simple local write, and product teams have to be conscious of this split when designing new features. |
+| Edgestore's colo-based sharding over plain horizontal MySQL sharding | Data usually read and written together (a user's own files and folders) is deliberately placed on one shard, so the common case gets cheap strong consistency for free, without any cross-machine coordination [10](#sources) | Anything that legitimately needs to touch two different shards at once — like sharing a file with a user who happens to live on a different shard — falls onto the slower, more complex cross-shard transaction path instead of a simple local write, and product teams have to be conscious of this split when designing new features. |
 | Two-phase commit with copy-on-write staging for cross-shard writes | Needed real transactional correctness across shards without paying the cost of duplicating a full object just to stage a pending change to it [10](#sources) | Every cross-shard write now takes extra network round trips to coordinate the commit, plus the overhead of maintaining an external transaction record so other requests can check its state without contacting every participant, all of which adds latency and moving parts a single-shard write never has to pay. |
 | Alki's hot/cold two-tier split instead of one system for all metadata | Rarely-read data like audit logs doesn't need expensive MySQL/SSD-backed capacity sitting under it at all — a DynamoDB-plus-S3 tier does the same job at roughly 1/6 the cost per GB per year [13](#sources) | Alki is an entirely separate storage system with its own daily compaction pipeline that now has to be operated, monitored, and kept correct alongside Edgestore, rather than Dropbox having just one metadata system to reason about. |
 | Build Panda instead of continuing to add MySQL shards | The "double the fleet" scaling strategy was becoming cost-prohibitive as shards individually grew faster than any single machine could keep up with, and Panda supports incremental capacity growth and automatic small-range rebalancing instead [11](#sources) | Panda is a whole new storage layer that had to be designed, built, and proven reliable underneath both Edgestore and the separate Filesystem service before either of those older systems could even begin consolidating onto it, meaning years of running three systems at once during the transition. |
@@ -634,6 +760,8 @@ The broader lesson Dropbox drew was architectural as much as operational: some s
 
 ## Glossary
 
+New to these terms? The [concepts](../concepts/README.md) folder explains the core ideas in depth.
+
 - **Sync engine**: the program running on your computer that watches your Dropbox folder and talks to Dropbox's servers so the same files show up everywhere ("sync engine"). Dropbox's is codenamed Nucleus.
 - **Block / chunk**: a big file cut into small, fixed-size pieces (Dropbox uses 4MB) before it's hashed, sent, or stored, instead of handling the whole file as one blob ("block"/"chunk").
 - **Content-defined chunking (CDC)**: a way of cutting a file into pieces where the cut points are picked based on the file's actual bytes (via a rolling checksum) instead of fixed positions, so a small edit near the start doesn't reshuffle every later piece. The natural alternative to Dropbox's approach — Dropbox's own documented block scheme is fixed-size, not CDC.
@@ -649,8 +777,8 @@ The broader lesson Dropbox drew was architectural as much as operational: some s
 - **OSD (object storage device)**: one physical machine, packed with disks, whose only job is to store and serve raw blocks — dumb, cheap, and there are hundreds of thousands of them ("storage node"/"OSD").
 - **Extent**: a 1–2GB segment of data actually sitting on a physical drive — the unit Magic Pocket's repair process measures its throughput in.
 - **Bucket / volume (Magic Pocket sense)**: a 1–2GB bundle of blocks that Magic Pocket manages, replicates while open, and erasure-codes once closed, as a single unit — not the same thing as an S3 "bucket."
-- **Sharding**: splitting one big database into smaller pieces by some key so each machine only holds part of the data.
-- **Colo (Edgestore sense)**: a hint that two pieces of data are usually read/written together, so Edgestore deliberately places them on the same physical shard for cheap strong consistency ("collocation").
+- **[Sharding](../concepts/sharding.md)**: splitting one big database into smaller pieces by some key so each machine only holds part of the data.
+- **[Colo (Edgestore sense)](../concepts/sharding.md)**: a hint that two pieces of data are usually read/written together, so Edgestore deliberately places them on the same physical shard for cheap strong consistency ("collocation").
 - **Two-phase commit (2PC)**: a way for several machines to agree on doing — or not doing — a multi-part update together, so it never ends up half-applied on some machines and not others ("two-phase commit"/"distributed transaction").
 - **Write amplification**: doing more total writes (or bytes written) than the logical size of the change you asked for — e.g. duplicating a whole object just to stage one field's change.
 - **MVCC (multi-version concurrency control)**: keeping a short history of old versions of a row around so reads don't have to block while a write to that row is happening ("MVCC").
@@ -660,7 +788,7 @@ The broader lesson Dropbox drew was architectural as much as operational: some s
 - **HAMR (heat-assisted magnetic recording)**: a newer hard-disk technology using a laser to write smaller, denser magnetic regions, mentioned by Dropbox engineers as a likely future step up in drive density.
 - **LSM-tree (log-structured merge-tree)**: a storage design that always appends new writes to a fresh, sorted "run" of data and periodically merges older runs together in the background — good for write-heavy or rarely-re-read data, which is why Alki's cold tier is modeled on it.
 - **Hot / cold tiering**: keeping frequently-accessed ("hot") data on fast, expensive storage and rarely-accessed ("cold") data on slower, much cheaper storage, and moving data between the two as its access pattern changes.
-- **Active-active vs. active-passive**: active-active means multiple regions can all accept live writes at once; active-passive means only one region is "live" at a time and the others stand by to take over ("fail over") if it goes down.
+- **[Active-active vs. active-passive](../concepts/replication.md)**: active-active means multiple regions can all accept live writes at once; active-passive means only one region is "live" at a time and the others stand by to take over ("fail over") if it goes down.
 - **RTO (recovery time objective)**: the target maximum time a system is allowed to be unavailable after a failure before it must be back up.
 - **Blast radius**: how much of a system a single failure, bug, or bad deploy can actually affect — a core goal of cell-based design is keeping this small.
 - **Conflicted copy**: the file Dropbox creates instead of silently overwriting one person's edit with another's, when two edits to the same file conflict — it renames the losing write rather than discarding it.

@@ -9,6 +9,7 @@
 - [Before you read: design it yourself](#before-you-read-design-it-yourself)
 - [The problem](#the-problem)
 - [Scale](#scale)
+- [Back-of-the-envelope math](#back-of-the-envelope-math)
 - [Requirements](#requirements)
 - [How it evolved](#how-it-evolved)
 - [High-level design](#high-level-design)
@@ -108,16 +109,16 @@ Every one of those sub-problems has a different failure mode and a different fix
 
 | Metric | Number | Source |
 |---|---|---|
-| Paid memberships | ~341.5M (Q1 2026) | [15](#sources) |
-| Share of global downstream internet traffic | ~15% (2023, Sandvine Global Internet Phenomena Report) | [17](#sources) |
+| Paid memberships | ~341.5M (Q1 2026) (unverified — the cited Q1 2026 letter states no membership count) | [15](#sources) |
+| Share of global internet traffic | ~15% of global internet traffic (2022 data, Sandvine Global Internet Phenomena Report, Jan 2023) | [17](#sources) |
 | Open Connect footprint | 8,000+ Open Connect Appliances, 1,000+ ISP partners, 50+ internet exchange points (undated precisely) | [16](#sources) |
 | ISP savings attributable to Open Connect | ~$1.25 billion saved by ISPs (cumulative, by 2021) | [16](#sources) |
-| Open Connect peering locations (current, Netflix's own site) | 300+ global peering locations, including 400G+ interconnects at hubs like Ashburn and London, and 800G–1.2TB combined at São Paulo | [3](#sources) |
+| Open Connect peering locations (current, Netflix's own site) | 300+ global peering locations, including 400G+ interconnects at hubs like Ashburn and London, and 800G–1.2T at São Paulo | [3](#sources) |
 | Storage Appliance capacity/throughput (current generation) | up to 120TB storage, ~200Gbps per box, ~400W | [3](#sources) |
 | Traffic delivered via direct ISP connections | ~95% globally (2018) | [4](#sources) |
 | Open Connect's share of Netflix streaming traffic at launch | ~5% (June 2012) | [18](#sources) |
-| Zuul gateway | 80+ Zuul 2 clusters routing 1M+ requests/sec to 100+ backend service clusters (2018) | [9](#sources) |
-| EVCache (in-memory cache tier) | ~2 trillion requests/day, ~18,000 servers, ~14 petabytes stored (2016) | [10](#sources) |
+| Zuul gateway | 80+ Zuul 2 clusters routing 1M+ requests/sec to ~100 backend service clusters (2018) | [9](#sources) |
+| EVCache (in-memory cache tier) | just under 2 trillion requests/day, 30M+ requests/sec at peak, hundreds of billions of objects across tens of thousands of memcached instances (2016) | [10](#sources) |
 | Titus (container platform) | ~3 million containers launched per week (April 2018) | [11](#sources) |
 | Per-title encoding | ~20% average bitrate reduction vs. one fixed bitrate ladder for all titles (2015) | [5](#sources) |
 | Cloud migration duration | August 2008 start to early January 2016 finish, ~7 years | [14](#sources) |
@@ -131,6 +132,108 @@ A few percent of bitrate saved sounds small until it's multiplied across hundred
 The jump from "5% of traffic on launch day" (2012) to "~95% delivered directly from ISPs" (2018) is the story of Open Connect completely displacing third-party CDNs over about six years.
 
 And a single live event pushing 65 million concurrent streams is a fundamentally different load shape than normal on-demand viewing — it's the single most common trigger for real, publicly visible Netflix outages (see [What happens when things break](#what-happens-when-things-break)).
+
+## Back-of-the-envelope math
+
+This is the rough arithmetic engineers sketch on a whiteboard to size a system before writing any code — good enough to catch a design that's off by orders of magnitude, not meant to be exact. Inputs marked [n] are pulled straight from the [Scale](#scale) table above and match it exactly; everything else is an explicit **Assumption**, never presented as fact.
+
+### 1. Peak aggregate bandwidth during the Tyson vs. Paul fight
+
+**Question:** At 65 million concurrent streams during the Tyson vs. Paul fight [20](#sources), how much aggregate bandwidth was Open Connect serving at that instant?
+
+**Inputs:**
+- Peak concurrent viewers: 65,000,000 [20](#sources)
+- Assumption: average stream bitrate ≈ 5 Mbps (a mid/high-quality HD rendition off the bitrate ladder; the real mix varies by device and network per ABR)
+
+**Math:**
+```text
+total bandwidth = 65,000,000 streams × 5 Mb/s
+                = 325,000,000 Mb/s
+                = 325,000 Gb/s
+                = 325 Tb/s
+```
+
+**Answer:** ~325 Tb/s of aggregate peak bandwidth.
+
+**What it tells you:** cross-checked against one Storage Appliance's ~200 Gbps throughput [3](#sources): 325,000 Gb/s ÷ 200 Gb/s ≈ 1,625 boxes' worth of simultaneous throughput for this one event alone, out of the 8,000+ OCA fleet [16](#sources) — a big slice of global capacity on one broadcast, exactly the load shape that produced ~90,000 Downdetector reports that same night [20](#sources). See [A traffic spike on a big release or live-event night](#a-traffic-spike-on-a-big-release-or-live-event-night).
+
+### 2. What per-title encoding is actually saving, in bandwidth terms
+
+**Question:** Per-title encoding saves ~20% average bitrate vs. one fixed ladder for every title [5](#sources) — how much *more* peak bandwidth would the same fight (Estimate 1: ~325 Tb/s) have needed without it?
+
+**Inputs:**
+- Estimate 1's answer: ~325 Tb/s at today's (per-title-optimized) average bitrate
+- Per-title encoding savings: ~20% average bitrate reduction vs. one fixed ladder [5](#sources)
+
+**Math:**
+```text
+pre-optimization bitrate = optimized bitrate / (1 − 0.20)
+                          = optimized bitrate / 0.80
+                          = optimized bitrate × 1.25
+
+pre-optimization bandwidth = 325 Tb/s × 1.25
+                            = 406.25 Tb/s
+
+extra bandwidth without per-title encoding = 406.25 − 325
+                                             = 81.25 Tb/s  (≈25% more)
+```
+
+**Answer:** ~406 Tb/s would have been needed — about 81 Tb/s (25%) more — without per-title encoding.
+
+**What it tells you:** a 20% average bitrate saving compounds into real absolute bandwidth at this scale, which is the economic case behind [Per-title and shot-based encoding](#per-title-and-shot-based-dynamic-optimizer-encoding): spend more encode-time compute once, rather than carry ~25% more network/storage capacity forever.
+
+### 3. Zuul's per-cluster load vs. EVCache's peak
+
+**Question:** With 80+ Zuul 2 clusters together routing 1M+ requests/sec [9](#sources), what's the average throughput per cluster, and how does that compare to EVCache's peak?
+
+**Inputs:**
+- Zuul: 80+ clusters, 1,000,000+ requests/sec combined [9](#sources)
+- EVCache: 30M+ requests/sec at peak [10](#sources)
+
+**Math:**
+```text
+requests/sec per Zuul cluster ≈ 1,000,000 / 80
+                               = 12,500 requests/sec per cluster (average)
+
+ratio to EVCache peak = 30,000,000 / 12,500
+                       = 2,400x
+```
+
+**Answer:** ~12,500 req/sec per Zuul cluster on average — about 2,400x lower than EVCache's 30M+ req/sec peak.
+
+**What it tells you:** most read traffic never reaches a backend service at all; it's served straight out of the cache tier, which is exactly the design this page's [Microservices on AWS](#microservices-on-aws-the-control-plane-stack) section describes — EVCache in front of everything, not an afterthought.
+
+### 4. EVCache requests per membership per day
+
+**Question:** With EVCache handling just under 2 trillion requests/day across Netflix's ~341.5M paid memberships (Q1 2026; this figure is itself noted on the page as unverified) [10](#sources)[15](#sources), roughly how many cache requests does a typical membership generate per day?
+
+**Inputs:**
+- EVCache: just under 2 trillion requests/day [10](#sources) — treated as ≈2 × 10^12 for this arithmetic
+- Paid memberships: ~341.5M (Q1 2026, unverified) [15](#sources)
+- 1 day = 1,440 minutes (rule of thumb)
+
+**Math:**
+```text
+requests/membership/day = 2,000,000,000,000 / 341,500,000
+                         ≈ 5,857 requests/membership/day
+
+requests/membership/minute = 5,857 / 1,440
+                            ≈ 4.1 requests/membership/minute
+```
+
+**Answer:** ~5,850-5,900 cache requests per paid membership per day — roughly 4 per minute.
+
+**What it tells you:** that's a steady many-per-minute drumbeat per household, not an occasional lookup — why a cache miss is treated as a first-class failure mode in [Microservices on AWS](#microservices-on-aws-the-control-plane-stack) rather than an edge case.
+
+**Rules of thumb used:**
+
+| Convention | Value used here |
+|---|---|
+| Bandwidth unit ladder | 1,000 Mb/s = 1 Gb/s; 1,000 Gb/s = 1 Tb/s (decimal, matching how CDNs/ISPs quote link speeds) |
+| Time unit | 1 day = 1,440 minutes (used to convert a daily total into a per-minute rate) |
+| "Just under X" / "X+" scale figures | treated as ≈X for arithmetic, explicitly flagged wherever used |
+| Peak vs. average | general convention: peak ≈ 2-3x daily average for systems with daily/weekly demand cycles |
+| Chaining estimates | reusing a prior estimate's **Answer** as the next one's **Input** is fine as long as the dependency is stated (Estimate 2 above) |
 
 ## Requirements
 
@@ -157,20 +260,20 @@ Requirements split cleanly into two groups: what a member can actually do, and t
 
 | Era | What happened |
 |---|---|
-| Before 2007 | Netflix is a DVD-by-mail company running its own datacenters, with a large relational (Oracle) database at the center of its DVD-shipping business [14](#sources). |
+| Before 2007 | Netflix is a DVD-by-mail company running its own datacenters, with large relational databases (vertically scaled single points of failure) at the center of its DVD-shipping business [14](#sources). |
 | 2007 | Netflix launches streaming ("Watch Instantly") alongside the DVD business. Early streaming video is delivered by third-party CDNs, not by Netflix itself [18](#sources). |
 | August 2008 | A major database corruption leaves Netflix unable to ship DVDs to members for three days. Netflix's own words: this was the trigger to move away from single, vertically-scaled points of failure in its own datacenters [14](#sources). |
-| 2008–2012 | Netflix begins migrating to AWS and, at the same time, re-architects its monolithic application into hundreds of independently deployable microservices backed by NoSQL stores (Cassandra, later DynamoDB) instead of one relational database [14](#sources). Streaming video itself is still served by third-party CDNs (Akamai, Limelight, Level 3) during this period [18](#sources). |
+| 2008–2012 | Netflix begins migrating to AWS and, at the same time, re-architects its monolithic application into hundreds of independently deployable microservices backed by NoSQL databases instead of one relational database [14](#sources). Streaming video itself is still served by third-party CDNs (Akamai, Limelight, Level 3) during this period [18](#sources). |
 | June 2012 | Netflix announces Open Connect, its own purpose-built CDN, explicitly to reduce reliance on third-party CDN vendors as bandwidth costs scale with Netflix's growth. At announcement, only about 5% of Netflix's streaming traffic runs over Open Connect [18](#sources). |
 | 2012–2016 | Open Connect scales out — appliances are placed for free inside ISP networks and at internet exchange points — while the AWS migration and microservices rewrite continue in parallel [14](#sources)[16](#sources). |
-| December 24, 2012 | An AWS-side outage takes down Netflix streaming for hours on Christmas Eve; AWS issues an apology days later [19](#sources). This kind of incident is a major reason chaos engineering practice hardens at Netflix over the following years. |
-| 2015 | Per-title encoding ships: instead of one fixed bitrate ladder for the whole catalog, each title gets a ladder tailored to its own complexity [5](#sources). The same year, "Chaos Kong" is introduced — deliberately simulating the loss of an entire AWS region in production [13](#sources). |
+| December 24, 2012 | An AWS-side outage takes down Netflix streaming on Christmas Eve; AWS issues an apology days later [19](#sources). This kind of incident is a major reason chaos engineering practice hardens at Netflix over the following years. |
+| 2015 | Per-title encoding ships: instead of one fixed bitrate ladder for the whole catalog, each title gets a ladder tailored to its own complexity [5](#sources). The same year, Netflix publicly describes "Chaos Kong" — already run regularly — deliberately simulating the loss of an entire AWS region in production [13](#sources). |
 | January 2016 | Netflix shuts down its last owned datacenter. The 7-year migration is complete: "we migrated from a monolithic app to hundreds of micro-services, and denormalized our data model, using NoSQL databases" [14](#sources). |
-| 2018 | Zuul is rewritten (Zuul 2) as an asynchronous, non-blocking gateway to handle far more concurrent connections per machine [9](#sources). Titus, Netflix's container platform, and EVCache's internals are published as by-then-mature, large-scale systems [10](#sources)[11](#sources). |
-| 2018–2020 | Per-title encoding is generalized into shot-based ("Dynamic Optimizer") encoding — optimizing the bitrate ladder per individual shot (scene) instead of per whole title — and ships to production in 2020 [6](#sources)[7](#sources). |
+| 2018 | Zuul 2 (built on Netty) is open-sourced [9](#sources); its asynchronous, non-blocking design for more concurrent connections per machine is unverified in the cited post. Titus, Netflix's container platform, and EVCache's internals are published as by-then-mature, large-scale systems [10](#sources)[11](#sources). |
+| 2018 | Per-title encoding is generalized into shot-based ("Dynamic Optimizer") encoding — optimizing the bitrate ladder per individual shot (scene) instead of per whole title — and ships to production (March 2018) [6](#sources)[7](#sources). |
 | 2024 | PlayAPI publishes prioritized load shedding: under overload, a real user-initiated play request is served before a speculative prefetch request [8](#sources). The same year, a single live sporting event (Tyson vs. Paul) draws 65M concurrent viewers and exposes real streaming problems for a meaningful share of them [20](#sources). |
 | Current | Open Connect's peering footprint has grown to 300+ global interconnection points, with Netflix operating its own network (AS2906) and a two-tier appliance hardware lineup for partners of different sizes [3](#sources). |
-| 2026 | Netflix reports ~341.5M paid memberships [15](#sources). |
+| 2026 | ~341.5M paid memberships (unverified — the cited Q1 2026 letter states no membership count) [15](#sources). |
 
 Most companies start simple and add complexity as they get burned by it. Netflix's whole architecture — microservices, its own CDN, chaos engineering — exists because a single relational database and a handful of rented CDN contracts stopped being able to survive Netflix's own growth.
 
@@ -203,12 +306,12 @@ Walkthrough:
 
 1. A client device talks to AWS through **Zuul**, Netflix's edge gateway. Zuul is an asynchronous, non-blocking L7 gateway (built on Netty) that Netflix runs as ~80 clusters handling over a million requests per second, doing dynamic routing, monitoring, and load shedding before a request ever reaches a backend service [9](#sources). Because it's asynchronous, one Zuul instance can hold open huge numbers of slow or idle client connections (a phone on bad wifi, a TV that's just sitting on the home screen) without dedicating a whole thread to each one.
 2. Everything that isn't playback — browsing, search, "because you watched X" rows — is served by thousands of independently deployable **microservices**, most running as containers on **Titus**, Netflix's own container management platform, which launched millions of containers per week even back in 2018 [11](#sources). Splitting these out means the team that owns recommendations can deploy ten times a day without ever touching, or waiting on, the team that owns billing.
-3. These services store data in **Cassandra** (durable, wide-column store) and read/write extremely hot data through **EVCache**, a Netflix-built layer over memcached that in 2016 was already handling on the order of two trillion requests a day across ~18,000 servers [10](#sources). The gap between those two numbers is the point of a cache: EVCache exists specifically so the vast majority of reads never have to touch Cassandra at all. Asynchronous events (viewing activity, telemetry) go through **Kafka** queues into stream-processing pipelines — publishing an event to a queue instead of calling the downstream service directly means a slow or temporarily-down analytics job never blocks the user-facing request that generated the event.
+3. These services store data in **Cassandra** (durable, wide-column store) and read/write extremely hot data through **EVCache**, a Netflix-built layer over memcached that in 2016 was already handling on the order of two trillion requests a day across tens of thousands of memcached instances [10](#sources). The gap between those two numbers is the point of a cache: EVCache exists specifically so the vast majority of reads never have to touch Cassandra at all. Asynchronous events (viewing activity, telemetry) go through **Kafka** queues into stream-processing pipelines — publishing an event to a queue instead of calling the downstream service directly means a slow or temporarily-down analytics job never blocks the user-facing request that generated the event.
 4. Playback is a separate, narrower path: a device's "press play" request goes to **PlayAPI**, the backend service that handles device-initiated manifest and license requests needed to start playback [8](#sources). PlayAPI talks to a DRM/license service and to the **Open Connect steering service**. Deliberately, this path touches far fewer services than browsing does — every extra hop between "you pressed play" and "video starts" is another thing that can be slow or down.
-5. Steering doesn't serve any video itself — it uses data OCAs report about their health, content availability, and network proximity to pick the best Open Connect Appliances for that specific client, and hands back a ranked list, not a single URL.
+5. Steering doesn't serve any video itself — it uses data OCAs report about their health, content availability, and network proximity to pick the best Open Connect Appliances for that specific client, and hands back a ranked list, not a single URL [2](#sources).
    > Note: simplified reference description — Netflix hasn't published the exact weighting its steering algorithm uses between proximity, current load, and content availability.
 6. The actual bytes then flow from an **Open Connect Appliance (OCA)** — a Netflix-owned box racked for free inside the ISP's own network — directly to the client. AWS is completely out of that data path. Close to 95% of Netflix's traffic globally moves this way, over direct connections between Open Connect and residential ISPs [4](#sources).
-7. If an OCA is missing a title (a cache miss), it fills from a peer OCA or, as a last resort, from Netflix's origin storage in S3 — but this is designed to be rare. OCAs are proactively filled with the catalog they're expected to need during nightly off-peak "fill" windows, not filled reactively on demand [2](#sources). This is the crucial difference from a generic CDN: a generic CDN learns what to cache by watching what gets requested; Open Connect tries to already know before the first request ever arrives.
+7. If the most-proximal OCAs are missing a title or overloaded (a cache miss), the client streams from a less-proximal OCA instead — designed to be rare [2](#sources). OCAs are proactively "prepositioned" with content Netflix forecasts they'll need, not filled reactively on demand [2](#sources); the nightly off-peak "fill" window and peer-OCA/S3 fallback are unverified (not in the cited sources). This is the crucial difference from a generic CDN: a generic CDN learns what to cache by watching what gets requested; Open Connect tries to already know before the first request ever arrives.
 
 Everything in steps 1–5 happens on AWS; everything in steps 6–7 happens on Open Connect. That single handoff — a ranked list of OCA URLs, handed from the control plane to the client — is the entire interface between the two systems.
 
@@ -363,7 +466,7 @@ Netflix's original 2015 **per-title encoding** work already customized the whole
 
 The **Dynamic Optimizer** framework then made this per-*shot* rather than per-title: it treats an entire video as a sequence of shots and searches for the optimal quality/bitrate trade-off (the "convex hull") independently for each one, optimizing against Netflix's own perceptual quality metric, VMAF [6](#sources).
 
-By 2020 this shipped in production as "optimized shot-based encodes," and Netflix noted the scale jump involved: a one-hour episode with an average 4-second shot length works out to roughly 900 shots that all need their own optimization pass, which is why retrofitting the parallel encoding pipeline to handle an order of magnitude more encode units was the main production challenge [7](#sources).
+By March 2018 this shipped in production as "optimized shot-based encodes," and Netflix noted the scale jump involved: a one-hour episode with an average 4-second shot length works out to roughly 900 shots that all need their own optimization pass, which is why retrofitting the parallel encoding pipeline to process significantly more encode units (the analysis step alone needed an order of magnitude more complexity) was the main production challenge [7](#sources).
 
 > Note: the diagram above is a simplified reference pipeline built from the stages Netflix has described across its per-title and shot-based encoding posts. Netflix hasn't published the full internal orchestration (job scheduling, retry/failure handling, exact parallelism) of this pipeline.
 
@@ -388,7 +491,7 @@ flowchart TD
 
 This is the other half of the "press play" flow: before any client can ask an OCA for a segment, Netflix has to have already decided, hours earlier, which appliances should hold which titles.
 
-Placement is directed rather than reactive — Netflix's own catalog is finite and regional popularity is forecastable, so appliances are proactively filled during off-peak hours instead of learning what to cache by watching cache misses happen live [2](#sources).
+Placement is directed rather than reactive — Netflix's own catalog is finite and regional popularity is forecastable, so appliances are proactively filled (the off-peak timing is unverified) instead of learning what to cache by watching cache misses happen live [2](#sources).
 
 Steering then combines OCA health, current load, which OCAs actually hold the requested content, and the client's network location to produce the ranked candidate list a client receives in its manifest. The output of this diagram (a ranked list) is exactly the input the sequence diagram above assumes the client already has.
 
@@ -400,9 +503,9 @@ Five components carry most of the weight in this design. Each section below cove
 
 ### Open Connect: placement, fill, and steering
 
-**What it is:** Netflix's own purpose-built CDN — physical appliances Netflix designs, owns, and ships for free to ISPs to rack inside their own networks, plus additional appliances Netflix operates at internet exchange points [1](#sources)[3](#sources).
+**What it is:** Netflix's own purpose-built CDN — physical appliances Netflix designs, owns, and ships for free to ISPs to rack inside their own networks, plus additional appliances Netflix operates at internet exchange points [4](#sources)[3](#sources).
 
-**Problem it solved:** By the early 2010s, Netflix's video traffic had grown large enough that third-party CDN vendors (Akamai, Limelight, Level 3) were both expensive at that volume and struggling to expand capacity as fast as Netflix's traffic was growing [18](#sources).
+**Problem it solved:** By the early 2010s, Netflix's video traffic had grown large enough that third-party CDN vendors (Akamai, Limelight, Level 3) were both expensive at that volume and Netflix wanted lower delivery cost and a better user experience [18](#sources).
 
 Buying delivery from someone else also meant Netflix couldn't control the one thing that most affects a viewer's experience: the network path the bytes actually take. A third-party CDN optimizes for many customers at once; it has no particular reason to prioritize Netflix's traffic quality over anyone else's on the same network.
 
@@ -421,19 +524,18 @@ Netflix currently offers ISPs two tiers of appliance hardware for that middle jo
 
 Both run on solid-state drives rather than spinning disks, which is what lets a single 2U box push that much throughput [3](#sources).
 
-Rather than caching whatever gets requested, most appliances are proactively, directedly filled: Netflix forecasts what a given ISP's members are likely to watch and pushes that content to the relevant OCAs during an off-peak "fill window," so that at peak viewing hours the appliance is already holding almost everything it will be asked for [2](#sources).
+Rather than caching whatever gets requested, most appliances are proactively, directedly filled: Netflix forecasts what a given ISP's members are likely to watch and pushes that content to the relevant OCAs ahead of demand (the off-peak "fill window" timing is unverified), so that at peak viewing hours the appliance is already holding almost everything it will be asked for [2](#sources).
 
 When a miss does happen anyway, Netflix's own research classifies *why* it happened:
 
-- the title is genuinely new and hasn't been pushed yet,
-- the appliance itself was only recently provisioned and hasn't finished its initial fill,
-- or demand for that title spiked in a way the forecast didn't predict [2](#sources).
+- a **content miss** — the files weren't on any OCA at the client's most-proximal site,
+- or a **health miss** — the local OCAs were saturated (CPU, disk, etc.) and couldn't take more traffic, so the client was sent to a less-proximal OCA [2](#sources).
 
 That classification is what lets the placement/fill logic actually improve over time, instead of just quietly falling back to origin every time something's missing.
 
 Getting the bytes from an OCA to an ISP in the first place is its own negotiated relationship, not just a cable Netflix plugs in. Netflix runs its own network (autonomous system AS2906) and connects to other networks two ways:
 
-- **Settlement-free peering** at public internet exchange points, under an openly published peering policy Netflix says it applies to "any network... with end-users viewing Netflix content" [3](#sources).
+- **Settlement-free peering** at public internet exchange points, under an openly published peering policy: Netflix "actively peers with networks that have end-users viewing Netflix content" [3](#sources).
 - A **private network interconnection (PNI)** — a direct link, typically 10G or 100G Ethernet, straight into a larger ISP's own network [3](#sources).
 
 Either way, Netflix asks partners for a 24/7 escalation contact and up-to-date routing registration, because a peering relationship that nobody maintains is exactly how you end up with a slow, silently-degrading path [3](#sources). At scale this adds up to 300+ peering locations, with some interconnects (Ashburn, London) running at 400Gbps and others (São Paulo) at 800Gbps–1.2Tbps combined [3](#sources).
@@ -480,7 +582,7 @@ A fixed, title-wide bitrate would have to be set high enough to cover shot B eve
 
 > **Why this matters:** this is the clearest example in the whole system of "spend more compute to save more bandwidth forever." Encoding is a one-time (per title) cost; every subsequent stream of that title benefits from the savings, which is why investing an order of magnitude more compute per title into shot-level optimization still nets out ahead at Netflix's playback volume.
 
-**What it costs:** The 2020 production rollout's main engineering problem wasn't the algorithm — it was that shot-based encoding needs roughly an order of magnitude more independent encode jobs per title than per-title encoding did, which meant retrofitting the whole pipeline's scheduling and parallelism [7](#sources).
+**What it costs:** The 2018 production rollout's main engineering problem wasn't the algorithm — it was that shot-based encoding turned a 1-hour episode's twenty 3-minute chunks into ~900 shots ("more than two orders of magnitude" more chunks per encode, per Netflix), which meant retrofitting the whole pipeline's scheduling and parallelism [7](#sources).
 
 ### PlayAPI and the device playback request flow
 
@@ -522,7 +624,7 @@ Splitting a monolith into independently deployable microservices means one team'
 
 **How it works internally:** each piece of the stack exists to solve one specific scaling problem the 2008-era monolith couldn't:
 
-- **Zuul 2** was rebuilt on an asynchronous, non-blocking model (built on Netty) specifically because the older thread-per-connection design didn't scale to the concurrency Netflix's traffic needed; it now runs as roughly 80 clusters handling over a million requests per second [9](#sources).
+- **Zuul 2** was rebuilt on an asynchronous, non-blocking model (built on Netty) (the thread-per-connection rationale is unverified in the cited post); it runs as roughly 80 clusters handling over a million requests per second [9](#sources).
 - **Titus** schedules containerized services onto AWS compute, launching millions of containers a week even in 2018 [11](#sources) — letting hundreds of teams each deploy independently without hand-provisioning machines.
 - **EVCache** sits in front of the slower, durable stores as a very-low-latency read/write layer for the hottest data, handling on the order of two trillion requests a day [10](#sources).
 - **Cassandra** provides a wide-column store that stays available and keeps accepting writes even when some nodes are down, trading some consistency guarantees for that availability — a deliberate reversal of the "one consistent relational database" model that failed in 2008.
@@ -544,7 +646,7 @@ The core idea inverts the usual instinct: instead of only trying to prevent fail
 
 **Problem it solved:** At Netflix's scale, some server, disk, or availability zone is failing at any given moment regardless of intent.
 
-A Christmas Eve 2012 outage caused by an AWS-side failure took down Netflix streaming for hours, with Amazon apologizing days later [19](#sources) — a visible example of exactly the kind of failure a system "designed" to tolerate region loss can still suffer if that tolerance has never actually been exercised.
+A Christmas Eve 2012 outage caused by an AWS-side failure took down Netflix streaming, with Amazon apologizing days later [19](#sources) — a visible example of exactly the kind of failure a system "designed" to tolerate region loss can still suffer if that tolerance has never actually been exercised.
 
 Netflix's response was to stop treating failure tolerance as a design assumption and start treating it as something to test continuously, during business hours, on purpose.
 
@@ -587,7 +689,7 @@ flowchart LR
 
 The video data plane is largely insulated from this: a client that already has a manifest and is mid-stream from an Open Connect Appliance doesn't need AWS to keep playing that segment. A region loss mainly threatens *new* session starts (manifest/license requests) and browsing, not already-playing streams — one more consequence of splitting the control plane from the data plane in the first place.
 
-The historical counterexample is instructive: the December 2012 Christmas Eve outage happened *before* this kind of deliberate, continuous regional-failure testing was mature, and it took Netflix's streaming down for hours [19](#sources). The difference between 2012 and today isn't that region failures stopped happening — AWS regions still fail — it's that Netflix now rehearses losing one on purpose.
+The historical counterexample is instructive: the December 2012 Christmas Eve outage happened *before* this kind of deliberate, continuous regional-failure testing was mature, and it took Netflix's streaming down [19](#sources). The difference between 2012 and today isn't that region failures stopped happening — AWS regions still fail — it's that Netflix now rehearses losing one on purpose.
 
 > Note: the exact internal mechanics of regional evacuation (traffic shifting, data replication lag, which services degrade vs. fail) aren't publicly detailed by Netflix; this describes the documented intent and testing practice, not the full internal runbook.
 
@@ -595,9 +697,9 @@ The historical counterexample is instructive: the December 2012 Christmas Eve ou
 
 The steering service continuously tracks OCA health, so an unhealthy appliance simply stops appearing in the ranked candidate list new sessions receive.
 
-A client already mid-stream that finds its current OCA unresponsive retries the next OCA from the ranked list it already has in hand — no round trip back through PlayAPI is required for that fallback [8](#sources).
+A client already mid-stream that finds its current OCA unresponsive retries the next OCA from the rank-ordered list it already has in hand [2](#sources) — no round trip back through PlayAPI is required for that fallback (inferred; not stated in the sources).
 
-If a title is missing from the OCAs a client can reach, the request falls back to a peer OCA and, only as a last resort, to origin storage in S3 [2](#sources). Because most appliances are already proactively filled with the catalog they're expected to need, this fallback path should be the exception, not the common case [2](#sources).
+If a title is missing from (or the load is too high on) the most-proximal OCAs, the client is steered to an OCA at a less-proximal site [2](#sources); a further fallback to a peer OCA or S3 origin is unverified. Because most appliances are already proactively filled with the catalog they're expected to need, this fallback path should be the exception, not the common case [2](#sources).
 
 ### A traffic spike on a big release or live-event night
 
@@ -619,7 +721,7 @@ The public record suggests this remains a harder problem than steady-state catal
 
 Because a client's manifest already contains multiple ranked OCA candidates and a full bitrate ladder, a client that temporarily can't reach PlayAPI or the steering service to refresh its manifest can typically keep playing from the OCA it's already connected to.
 
-Similarly, an OCA that can't reach S3 origin during its nightly fill window just serves whatever it already cached and retries the fill later, since fill is a proactive off-peak process, not something synchronous with a live playback request [2](#sources).
+Similarly, an OCA that can't reach S3 origin during its nightly fill window just serves whatever it already cached and retries the fill later, since fill is a proactive process (off-peak timing unverified), not something synchronous with a live playback request [2](#sources).
 
 In both directions, the partition is survivable specifically because the two halves of the system were designed not to need each other on every single request.
 
@@ -634,11 +736,11 @@ Each row below is a place Netflix chose one architecture over a simpler or cheap
 | Decision | Why | Trade-off |
 |---|---|---|
 | Build and operate its own CDN (Open Connect) instead of buying from third-party CDNs | Video bytes are almost all of Netflix's traffic; owning the delivery layer means control over quality of experience and the ability to embed hardware directly inside ISP networks [18](#sources) | Enormous capital and logistics cost: designing, manufacturing, shipping, and remotely operating physical appliances worldwide |
-| Proactive, directed caching — push most of the catalog to appliances overnight rather than caching reactively on demand | Netflix's catalog is finite and regional popularity is forecastable, so a directed cache can hit much higher offload than a reactive one [2](#sources) | Requires accurate per-region demand forecasting; storage-dense appliances add hardware cost; doesn't suit unpredictable/live demand |
-| Split the system into a control plane (AWS) and a data plane (Open Connect) that barely interact | AWS gives elastic compute for bursty, ever-changing API/recommendation workloads; OCAs stay simple, purpose-built boxes that just serve bytes fast [9](#sources) | Two separate operational domains (steering, health reporting, fill) have to be kept consistent with each other |
+| Proactive, directed caching — push most of the catalog to appliances ahead of demand (overnight timing unverified) rather than caching reactively on demand | Netflix's catalog is finite and regional popularity is forecastable, so a directed cache can hit much higher offload than a reactive one [2](#sources) | Requires accurate per-region demand forecasting; storage-dense appliances add hardware cost; doesn't suit unpredictable/live demand |
+| Split the system into a control plane (AWS) and a data plane (Open Connect) that barely interact | AWS gives elastic compute for bursty, ever-changing API/recommendation workloads; OCAs stay simple, purpose-built boxes that just serve bytes fast [2](#sources) | Two separate operational domains (steering, health reporting, fill) have to be kept consistent with each other |
 | Per-title, then per-shot, video encoding instead of one universal bitrate ladder | Video complexity varies hugely by title and even by scene, so tailoring the ladder saves bandwidth without a visible quality loss [5](#sources)[7](#sources) | Massively more encoding compute — hundreds of shots per hour of content, each needing its own optimization pass [7](#sources) |
 | Run chaos engineering (Chaos Monkey, Chaos Kong) continuously in production | At Netflix's scale, instances and even whole regions fail regularly regardless of intent — better to trigger failure deliberately, during business hours, than get surprised by it [13](#sources) | Only works if services are actually built to degrade gracefully everywhere; badly-scoped experiments can cause the very outage they're meant to prevent |
-| Rebuild the gateway (Zuul 2) on an asynchronous, non-blocking model instead of thread-per-request | The old thread-per-connection model didn't scale to the concurrency Netflix's traffic needed [9](#sources) | Asynchronous code is harder to write, trace, and debug than simple blocking code |
+| Rebuild the gateway (Zuul 2) on an asynchronous, non-blocking model instead of thread-per-request | The old thread-per-connection model didn't scale to the concurrency Netflix's traffic needed (unverified; not in the cited Zuul 2 post [9](#sources)) | Asynchronous code is harder to write, trace, and debug than simple blocking code |
 | Prioritize user-initiated requests over prefetch requests inside PlayAPI when shedding load | Under overload, the request that matters is the one blocking a member who just pressed play, not a speculative prefetch [8](#sources) | Some latency benefit from prefetching is deliberately sacrificed during incidents |
 | Rewrite the whole application as microservices during the AWS migration, rather than lift-and-shift the existing monolith | The 2008 outage exposed a monolithic relational database as a single point of failure; moving the *same* fragile design onto someone else's servers wouldn't have fixed that [14](#sources) | A 7-year migration instead of a much faster infrastructure-only move; had to rebuild working systems while still operating the business |
 | Offer two tiers of appliance hardware (high-throughput Storage Appliances vs. lower-cost Global Appliances) instead of one standard box | Smaller ISPs and emerging markets don't need — and can't always justify hosting — a 120TB, 200Gbps box; a cheaper 60TB/80Gbps tier lowers the bar to participate [3](#sources) | Two hardware SKUs to design, manufacture, and support instead of one, and more complex placement decisions about which tier goes where |
@@ -662,9 +764,11 @@ None of these patterns are unique to video streaming — they're general answers
 
 ## Glossary
 
+New to these terms? The [concepts](../concepts/README.md) folder explains the core ideas in depth.
+
 Every jargon term used above, in the order it's most useful to learn them.
 
-- **CDN (Content Delivery Network)**: a network of servers placed close to users so content doesn't have to travel all the way back to one central data center every time.
+- **[CDN (Content Delivery Network)](../concepts/cdn.md)**: a network of servers placed close to users so content doesn't have to travel all the way back to one central data center every time.
 - **Open Connect Appliance (OCA)**: a physical server Netflix builds and owns, racked either at an internet exchange or for free inside an ISP's own network, that stores and serves Netflix's video files.
 - **ISP (Internet Service Provider)**: the company (e.g. a cable or fiber provider) that connects a household or business to the internet.
 - **Peering**: two networks agreeing to connect directly and exchange traffic, often without charging each other ("settlement-free peering").
@@ -682,7 +786,7 @@ Every jargon term used above, in the order it's most useful to learn them.
 - **VMAF (Video Multi-Method Assessment Fusion)**: a video quality metric Netflix developed to estimate how a video would actually look to a human viewer, used as the target when deciding how much to compress something.
 - **Convex hull (in encoding)**: out of many possible bitrate/resolution combinations tested for a shot, the subset that gives the best quality for each bitrate — the optimal trade-off curve.
 - **DRM (Digital Rights Management) / license**: the mechanism that cryptographically restricts playback to authorized devices/sessions, so video can't just be freely copied.
-- **Microservices**: splitting one big application into many small, independently deployable services, each responsible for one narrow thing, instead of one large monolith.
+- **[Microservices](../concepts/microservices.md)**: splitting one big application into many small, independently deployable services, each responsible for one narrow thing, instead of one large monolith.
 - **Monolith**: the opposite of microservices — one large application where all functionality is built and deployed together, so a bug or overload in one part can affect the whole thing.
 - **API gateway**: a single front-door service that all incoming requests pass through first, which can route, monitor, secure, and rate-limit traffic before it reaches backend services.
 - **Zuul**: Netflix's own API gateway; version 2 rewrote it to be asynchronous and non-blocking (built on Netty) so it could handle far more concurrent connections per machine.
@@ -691,7 +795,7 @@ Every jargon term used above, in the order it's most useful to learn them.
 - **EVCache**: Netflix's own distributed in-memory caching layer, built on top of memcached, used to serve very frequently-read data with very low latency.
 - **Memcached**: a widely-used, simple in-memory key-value store often used as a cache in front of a slower database.
 - **Cassandra**: a distributed database designed to stay available and keep accepting writes even if some of its machines are down, at the cost of some consistency guarantees.
-- **Kafka**: a distributed "log" system used as a queue/message bus — services publish events to it and other services read and react to those events, often at a delay from real time.
+- **[Kafka](../concepts/message-queues-and-logs.md)**: a distributed "log" system used as a queue/message bus — services publish events to it and other services read and react to those events, often at a delay from real time.
 - **Availability zone (AZ) / region (AWS)**: AWS groups its data centers into isolated "availability zones" within a "region"; designing across zones/regions protects against one data center, or even one whole region, going down.
 - **Control plane**: the part of a system responsible for decisions and coordination (auth, routing, metadata) rather than the actual bulk data transfer itself. For Netflix, this is the AWS-hosted layer.
 - **Data plane**: the part of a system that actually moves the bulk data (here, video bytes). For Netflix, this is Open Connect, deliberately kept separate from the control plane.
@@ -719,19 +823,19 @@ Every jargon term used above, in the order it's most useful to learn them.
 
 ## Sources
 
-1. Netflix TechBlog — ["Serving 100 Gbps from an Open Connect Appliance"](https://netflixtechblog.com/serving-100-gbps-from-an-open-connect-appliance-cdb51dda3b99) (2015)
+1. Netflix TechBlog — ["Serving 100 Gbps from an Open Connect Appliance"](https://netflixtechblog.com/serving-100-gbps-from-an-open-connect-appliance-cdb51dda3b99) (2017)
 2. Netflix TechBlog — ["Driving Content Delivery Efficiency Through Classifying Cache Misses"](https://netflixtechblog.com/driving-content-delivery-efficiency-through-classifying-cache-misses-ffcf08026b6c)
 3. Netflix Open Connect — site: [Appliances (hardware specs)](https://openconnect.netflix.com/en/appliances/) and [Peering](https://openconnect.netflix.com/en/peering/)
 4. *(third-party)* APNIC Blog — ["Netflix content distribution through Open Connect"](https://blog.apnic.net/2018/06/20/netflix-content-distribution-through-open-connect/) (2018)
 5. Netflix TechBlog — ["Per-Title Encode Optimization"](http://techblog.netflix.com/2015/12/per-title-encode-optimization.html) (Dec 2015)
 6. Netflix TechBlog — ["Dynamic Optimizer — a perceptual video encoding optimization framework"](https://netflixtechblog.com/dynamic-optimizer-a-perceptual-video-encoding-optimization-framework-e19f1e3a277f) (2018)
-7. Netflix TechBlog — ["Optimized shot-based encodes: Now Streaming!"](https://netflixtechblog.com/optimized-shot-based-encodes-now-streaming-4b9464204830) (2020)
+7. Netflix TechBlog — ["Optimized shot-based encodes: Now Streaming!"](https://netflixtechblog.com/optimized-shot-based-encodes-now-streaming-4b9464204830) (2018)
 8. Netflix TechBlog — ["Enhancing Netflix Reliability with Service-Level Prioritized Load Shedding"](https://netflixtechblog.com/enhancing-netflix-reliability-with-service-level-prioritized-load-shedding-e735e6ce8f7d) (2024)
 9. Netflix TechBlog — ["Open Sourcing Zuul 2"](https://netflixtechblog.com/open-sourcing-zuul-2-82ea476cb2b3) (2018)
 10. Netflix TechBlog — ["Caching for a Global Netflix"](http://techblog.netflix.com/2016/03/caching-for-global-netflix.html) (2016)
 11. Netflix TechBlog — ["Titus, the Netflix container management platform, is now open source"](https://netflixtechblog.com/titus-the-netflix-container-management-platform-is-now-open-source-f868c9fb5436) (2018)
 12. Netflix TechBlog — ["The Netflix Simian Army"](https://netflixtechblog.com/the-netflix-simian-army-16e57fbab116)
-13. Netflix TechBlog — ["Chaos Engineering Upgraded"](http://techblog.netflix.com/2015/09/chaos-engineering-upgraded.html) (2015, introduces Chaos Kong)
+13. Netflix TechBlog — ["Chaos Engineering Upgraded"](http://techblog.netflix.com/2015/09/chaos-engineering-upgraded.html) (2015, describes Chaos Kong)
 14. Netflix — ["Completing the Netflix Cloud Migration"](http://about.netflix.com/en/news/completing-the-netflix-cloud-migration) (Jan 2016)
 15. Netflix — [Q1 2026 Shareholder Letter](https://s22.q4cdn.com/959853165/files/doc_financials/2026/q1/FINAL-Q1-26-Shareholder-Letter.pdf) (paid memberships figure)
 16. *(third-party)* Wikipedia — ["Open Connect"](https://en.wikipedia.org/wiki/Open_Connect)

@@ -15,6 +15,7 @@
 - [Before you read: design it yourself](#before-you-read-design-it-yourself)
 - [The problem](#the-problem)
 - [Scale](#scale)
+- [Back-of-the-envelope math](#back-of-the-envelope-math)
 - [Requirements](#requirements)
 - [How it evolved](#how-it-evolved)
 - [High-level design](#high-level-design)
@@ -42,7 +43,7 @@ Think about what a normal thread-per-connection web server pays per connection, 
 <details>
 <summary>How WhatsApp does it</summary>
 
-Every connection gets its own lightweight Erlang process (not an OS thread) on the BEAM VM, running on tuned FreeBSD boxes — cheap enough per-process that one box held ~1M connections on average by 2014 (a 2012 demo hit 2M on a single box). The trade-off: a smaller hiring pool than mainstream stacks, and getting there required patching the BEAM emulator and the FreeBSD kernel itself (socket accounting, `kqueue`), not just picking the "right" language.
+Every connection gets its own lightweight Erlang process (not an OS thread) on the BEAM VM, running on tuned FreeBSD boxes — cheap enough per-process that one box held ~1M connections on average by 2014 (a 2012 demo hit 2M on a single box). The trade-off: a smaller hiring pool than mainstream stacks, and getting there required patching the BEAM emulator and tuning/backporting FreeBSD kernel pieces (timers, lock contention, the network driver), not just picking the "right" language.
 
 Deep dive: [The Erlang/BEAM concurrency model and FreeBSD tuning](#the-erlangbeam-concurrency-model-and-freebsd-tuning).
 
@@ -127,7 +128,6 @@ This page tries to answer three questions a junior engineer should be able to an
 
 | Metric | Number | Source |
 |---|---|---|
-| Daily active users | 2 billion+ (Apr 2025) | [11] *(third-party report of Meta's Q1 2025 earnings call)* |
 | Monthly active users | 3 billion+ (Apr 2025) | [11] *(third-party)* |
 | Monthly active users | 465 million (2014) | [6] *(third-party)* |
 | Messages sent per day | 40 billion (2014) | [6] *(third-party)* |
@@ -143,10 +143,10 @@ This page tries to answer three questions a junior engineer should be able to an
 | Peak messages received/sec | 342,000 (2014) | [6] *(third-party)* |
 | Peak messages sent/sec | 712,000 (2014) | [6] *(third-party)* |
 | Backend/ops engineers | ~10, supporting ~40M users each (2014) | [6] *(third-party)* |
-| Routing table (Mnesia) size | ~2TB RAM, 16 partitions, 18 billion records (2014) | [6] *(third-party)* |
+| Mnesia database size | ~2TB RAM, 16 partitions, 18 billion records (2014) | [6] *(third-party)* |
 | Linked non-phone devices per account | up to 4, i.e. 5 devices total (2021) | [1] |
 | Group size limit | 1,024 members (as of 2022) | [16] |
-| Community size limit | up to 100 groups / 2,000 members (2022) | [13], [14] |
+| Community size limit | up to 100 groups / 2,000 members (2022) *(unverified: not stated in [13] or [14])* | — |
 | Peak outbound bandwidth (Christmas Eve) | 146 Gb/s (2014) | [6] *(third-party)* |
 | Photos downloaded (New Year's Eve) | 2 billion (2014) | [6] *(third-party)* |
 
@@ -164,6 +164,119 @@ What these numbers mean in practice:
 
   The architectural philosophy — process-per-connection, minimal server state, end-to-end encryption — has stayed recognizably the same the whole way, which is itself a data point about how well the original design choices held up.
 
+## Back-of-the-envelope math
+
+Back-of-the-envelope math is the rough, order-of-magnitude estimating engineers do on a whiteboard — no calculator, no precise data, just enough arithmetic to check whether a design idea is remotely plausible before building it. Inputs marked **[n]** come straight from this page's [Scale](#scale) table and cite the same source; everything else is a labeled **Assumption**, not a fact.
+
+### Estimate 1: How much spare capacity did the 2014 fleet have at peak?
+
+**Question:** At the reported 2014 peak of 147 million concurrent connections, how much of the fleet's own stated per-server capacity was actually in use?
+
+**Inputs:**
+- Total servers: ~550 (2014) [6]
+- Connections per server: ~1,000,000 average (2014) [5], [6]
+- Peak concurrent connections (fleet-wide): 147 million (2014) [6]
+
+**Math:**
+```text
+nominal fleet capacity = 550 servers × 1,000,000 conns/server
+                        = 550,000,000 connections
+
+utilization at peak    = 147,000,000 / 550,000,000
+                        ≈ 0.267 → ~27%
+```
+
+**Answer:** ~27% of nominal fleet capacity was in use at the reported 2014 peak.
+
+**What it tells you:** the fault-tolerance story for a holiday traffic spike (see [What happens when things break](#what-happens-when-things-break)) is "we already had headroom," not a clever failure-absorption trick — running well under the per-box ceiling is exactly what leaves slack for an hours-long global surge.
+
+### Estimate 2: How much bandwidth does peak text traffic alone need?
+
+**Question:** How much network bandwidth does 712,000 text messages/sec (the 2014 peak) actually require, on its own?
+
+**Inputs:**
+- Peak messages sent/sec: 712,000 (2014) [6]
+- Assumption: an average text message, with protocol overhead, is about 100 bytes.
+
+**Math:**
+```text
+bytes/sec = 712,000 msgs/s × 100 bytes/msg
+          = 71,200,000 bytes/s ≈ 71.2 MB/s
+
+bits/sec  = 71,200,000 bytes/s × 8
+          ≈ 569,600,000 bits/s ≈ 0.57 Gb/s
+```
+
+**Answer:** ~0.57 Gb/s for peak text sends alone.
+
+**What it tells you:** that's roughly 260x smaller than the 146 Gb/s Christmas Eve bandwidth peak [6] — confirming media (photos, video, voice), not text, dominates bandwidth, which is exactly why large media is kept on a separate path from routing traffic (see [High-level design](#high-level-design), step 9).
+
+### Estimate 3: How "idle" is an idle connection, really?
+
+**Question:** Given 70 million+ Erlang inter-process messages/sec fleet-wide, how many internal messages does a single connection generate per second on average?
+
+**Inputs:**
+- Erlang inter-process messages/sec: 70 million+ (2014) [6]
+- Peak concurrent connections (fleet-wide): 147 million (2014) [6]
+
+**Math:**
+```text
+messages per connection per second = 70,000,000 / 147,000,000
+                                    ≈ 0.48/sec
+```
+
+**Answer:** under 1 internal message per connection per second (~0.5/sec).
+
+**What it tells you:** confirms the claim that a connection sitting idle in someone's pocket really does cost the server almost nothing — the entire premise behind the [Erlang/BEAM concurrency model](#the-erlangbeam-concurrency-model-and-freebsd-tuning).
+
+### Estimate 4: How big is one Mnesia record, on average?
+
+**Question:** Given ~2TB of RAM holding 18 billion records, what's the average record size?
+
+**Inputs:**
+- Mnesia database size: ~2TB RAM, 18 billion records (2014) [6]
+- Rule of thumb: 1 TB ≈ 10^12 bytes.
+
+**Math:**
+```text
+average record size = (2 × 10^12 bytes) / (18 × 10^9 records)
+                     ≈ 111 bytes/record
+```
+
+**Answer:** ~111 bytes per record.
+
+**What it tells you:** that's tiny — consistent with [what the server actually tracks](#3-data-model-what-the-server-actually-tracks) being routing pointers and key metadata, not message content. This is a sanity check on the "no `MESSAGES` table" claim, not a stored-message count.
+
+### Estimate 5: How much cheaper are Sender Keys than pairwise encryption for a max-size group?
+
+**Question:** For a 1,024-member group (the documented cap), how many encryption operations does Sender Keys save versus encrypting once per member?
+
+**Inputs:**
+- Group size limit: 1,024 members (2022) [16]
+- Assumption: a naive per-recipient (pairwise) scheme needs one encryption per member per message; multi-device fan-out is ignored here for simplicity.
+
+**Math:**
+```text
+pairwise cost per message    = 1,024 encryptions
+Sender Keys cost per message = 1 encryption
+
+ratio = 1,024 / 1 = 1,024 ≈ 10^3
+```
+
+**Answer:** ~1,000x (three orders of magnitude) fewer encryption operations per message.
+
+**What it tells you:** this is the concrete number behind the claim in [Group messaging at scale](#group-messaging-at-scale-sender-keys-re-keying-and-communities) that pure client-fanout "would multiply that cost by three orders of magnitude" — quantifying exactly why a 1,024-member group can't use the same scheme as a 1:1 chat.
+
+### Rules of thumb used
+
+| Rule | Value |
+|---|---|
+| 1 day | ~86,400 s ~ 10^5 s |
+| 1 TB | ~10^12 bytes |
+| Peak vs. average load | typically ~2-3x, though viral/holiday events can go far higher |
+
+These are general estimating conventions, not WhatsApp-specific facts.
+
 ## Requirements
 
 **Functional:**
@@ -172,7 +285,7 @@ What these numbers mean in practice:
 - Show delivery state to the sender (sent / delivered / read). *People treat delivery status as a signal about relationships, not just plumbing — it has to be right.*
 - Let one account use up to four extra devices (desktop, web, tablet) alongside the phone, all end-to-end encrypted. *Many users want to type on a laptop keyboard without keeping the phone open and active.*
 - Sync chat metadata (contacts, archived chats, starred messages) across a user's own devices without the server reading it. *Multi-device only feels complete if a newly-linked device looks like it already "knows" your chat list.*
-- Support groups up to 1,024 members and Communities that bundle up to 100 groups (2022) [13], [14]. *Families, schools, and neighborhoods needed structured many-to-many messaging, not just 1:1 chat.*
+- Support groups up to 1,024 members and Communities that bundle multiple groups under one announcement channel (2022) [13], [14]. *Families, schools, and neighborhoods needed structured many-to-many messaging, not just 1:1 chat.*
 
 **Non-functional:**
 - **End-to-end encryption by default** for every message, call, and file. The server must never be able to read content, because messaging is one of the most sensitive things people do with a phone and WhatsApp's whole brand promise rests on this.
@@ -181,7 +294,7 @@ What these numbers mean in practice:
 - **High availability**, a telecom-grade "never go down" bar inherited from Erlang's telecom heritage. Messaging is infrastructure people rely on for work, family emergencies, and daily life.
 - **Forward secrecy:** compromising today's keys shouldn't expose yesterday's messages. This bounds the damage of any future key leak.
 - **Minimal server-side state:** WhatsApp does not want to be a permanent message store. This reduces what a breach could expose and keeps the "your chats are yours" promise credible.
-- **Bounded, predictable fan-out cost per message:** a message to a 1,024-member group must still deliver quickly, which is why group size is capped rather than unlimited [16].
+- **Bounded, predictable fan-out cost per message:** a message to a 1,024-member group must still deliver quickly, which is plausibly one reason group size is capped rather than unlimited (inference; the sources state the cap, not the reason) [16].
 
 ## How it evolved
 
@@ -190,12 +303,12 @@ timeline
   title WhatsApp architecture timeline
   2009 : Founded by Koum and Acton, ex-Yahoo engineers : first iPhone release
   2012 : Rick Reed's Erlang Factory talk documents 2 million TCP connections on one server
-  2014 : Facebook acquires WhatsApp for 19 billion dollars : about 465 million monthly users, 11000 Erlang cores, roughly 50 engineers
+  2014 : Facebook acquires WhatsApp for 19 billion dollars : about 465 million monthly users, 11000 cores, about 10 Erlang engineers
   2015 : Voice and video calling launches, built on Meta CDN relay infrastructure
   2016 : End to end encryption via the Signal Protocol rolled out to all chats and calls
   2021 : Multi device architecture ships, up to 4 extra linked devices per account
-  2022 : Communities feature ships, bundling up to 100 groups with an announcement channel
-  2025 : Meta reports over 2 billion daily and 3 billion monthly active users
+  2022 : Communities feature ships, bundling groups under an announcement channel
+  2025 : Meta reports over 3 billion monthly active users
 ```
 
 WhatsApp's public story is unusually consistent across every era: start with the simplest thing that could plausibly work at the *next* order of magnitude, then rebuild the layer that breaks.
@@ -210,7 +323,7 @@ There's no public record of large-scale infrastructure decisions from this perio
 
 That was a number most web companies at the time weren't even trying to reach on a *fleet*, let alone a single machine [5].
 
-The talk is worth reading in full for anyone who wants the texture of the era: the bottlenecks weren't clever algorithmic wins, they were unglamorous things like lock contention in the kernel's socket-accounting code and BEAM scheduler behavior under hundreds of thousands of simultaneous timers — the kind of grinding, one-bottleneck-at-a-time work that "we chose the right language" glosses over [5].
+The talk is worth reading in full for anyone who wants the texture of the era: the bottlenecks weren't clever algorithmic wins, they were unglamorous things like lock contention ("from 200k to 2M were all contention fixes"), the kernel's timeofday lock, and BEAM timer-wheel behavior — the kind of grinding, one-bottleneck-at-a-time work that "we chose the right language" glosses over [5].
 
 **2014 — the acquisition, and the ratio that keeps getting cited.** By the time Facebook acquired WhatsApp, that same philosophy — Erlang, FreeBSD, Mnesia, a tiny team — was running the backend for nearly half a billion monthly users on roughly 550 machines.
 
@@ -228,9 +341,9 @@ Making that assumption go away without weakening the encryption guarantee took y
 
 **2022 — Communities, a product-level change on old primitives.** Communities were layered on top of group chats you already had, wrapped in an announcement channel and a shared membership list.
 
-They're capped at a size (100 groups, up to 2,000 members) chosen to keep fan-out latency bounded rather than left unlimited [13], [14], [16]. Unlike multi-device, this didn't require new cryptographic protocol work — it reused Sender Keys and existing group machinery.
+Groups inside them were raised to 1,024 members [14]; the often-quoted Community caps (100 groups, 2,000 members) aren't stated in [13] or [14] *(unverified)*, and the "bounded fan-out" rationale is inference. Unlike multi-device, this didn't require new cryptographic protocol work — it reused Sender Keys and existing group machinery.
 
-**2025 — the numbers that show the growth curve.** Meta's own reported figures put WhatsApp at 2 billion+ daily and 3 billion+ monthly active users — roughly 6.5x the 2014 monthly-user figure, run on an architecture that is still recognizably the same one described in the 2012 and 2014 talks [11].
+**2025 — the numbers that show the growth curve.** Meta's own reported figures put WhatsApp at 3 billion+ monthly active users — roughly 6.5x the 2014 monthly-user figure, run on an architecture that is still recognizably the same one described in the 2012 and 2014 talks [11].
 
 ## High-level design
 
@@ -261,7 +374,7 @@ Walking through it:
 
    This lookup is cached client-side and only re-fetched when the device list actually changes (a new device links, or an old one is removed), so it doesn't happen on every message.
 
-3. **Looking up where the recipient lives.** The connection server that owns the sender's socket looks up, in a shared **Mnesia** routing table, which server (if any) currently holds a live connection for the recipient [6].
+3. **Looking up where the recipient lives.** The connection server that owns the sender's socket looks up, in a shared **Mnesia** routing table, which server (if any) currently holds a live connection for the recipient. *(Reference design: [6] documents an in-memory Mnesia database and a routing layer built on Erlang's pg2 process groups, but does not say Mnesia specifically is the "who is connected where" table.)*
 
    Because Mnesia is an in-memory, replicated database native to Erlang, this lookup is a local or same-datacenter operation, not a round trip to a separate storage tier.
 
@@ -285,7 +398,7 @@ Walking through it:
 
    This keeps big binary payloads off the same pipe that has to stay fast for text.
 
-> Note: step 9's media-handling detail is a simplified reference design; WhatsApp has not published the literal media pipeline, but the "encrypt client-side, upload once, send a pointer" pattern is consistent with how the Signal Protocol's media transport is documented to work and with WhatsApp's server-side minimal-storage design principle [2].
+> Note: step 9's "encrypt client-side, upload to a blob store, send a pointer message carrying the key, HMAC key, and SHA256 hash" flow is documented in WhatsApp's security whitepaper [2]; the storage/CDN tiering behind the blob store is not.
 
 ## Low-level design
 
@@ -372,14 +485,14 @@ flowchart TD
   Callee -->|"3. accept"| Sig
   Sig -->|"4. pick nearest relay cluster"| Select["Cluster selection algorithm"]
   Select --> Relay["Relay cluster, hundreds of containers,<br/>runs on Meta CDN PoP"]
-  Caller <-->|"5. encrypted SRTP media"| Relay
-  Relay <-->|"5. encrypted SRTP media"| Callee
+  Caller <-->|"5. encrypted media"| Relay
+  Relay <-->|"5. encrypted media"| Callee
   Relay -.->|"network change, e.g. wifi to cellular"| Reselect["Re-run cluster selection mid-call"]
 ```
 
 Signaling (setting the call up, notifying devices) and media relay (moving the actual audio/video bytes) are deliberately separate services, because they have opposite scaling shapes: signaling is small, bursty messages; relay is sustained, high-bandwidth streams that must sit physically close to the user to keep latency low.
 
-Splitting them means WhatsApp can place relay clusters on CDN points-of-presence near users while keeping signaling centralized [8]. It also means a relay cluster having a bad day is a capacity/placement problem the signaling layer can route around, rather than a monolithic outage — the selection algorithm in step 4 can simply pick a different cluster.
+Splitting them means WhatsApp can place relay clusters on CDN points-of-presence near users [8]; where signaling runs isn't stated. It also means a relay cluster having a bad day is a capacity/placement problem the signaling layer can route around, rather than a monolithic outage — the selection algorithm in step 4 can simply pick a different cluster.
 
 ### 5. Message delivery as a state machine
 
@@ -403,7 +516,7 @@ That's why "delivery status" isn't a simple boolean flag the server flips; it's 
 
 ### The Erlang/BEAM concurrency model and FreeBSD tuning
 
-> **Why this matters:** this single decision — one lightweight process per connection, on a runtime designed for it — is the reason a ~50-person engineering org could run infrastructure for hundreds of millions of people.
+> **Why this matters:** this single decision — one lightweight process per connection, on a runtime designed for it — is the reason a team of ~10 Erlang engineers could run infrastructure for hundreds of millions of people.
 
 Erlang's BEAM virtual machine schedules extremely cheap, isolated "processes" (nothing to do with OS processes — more like green threads with no shared memory) across a small number of OS threads.
 
@@ -411,7 +524,7 @@ Give every connected user their own process, and one user's slow client or malfo
 
 Getting to 2 million connections on one box in 2012 required more than just picking Erlang, though.
 
-Rick Reed's talk describes patching the BEAM emulator itself and tuning the FreeBSD kernel — file descriptor limits, socket buffer behavior, `kqueue` event notification. At that density, contention issues that are invisible at 10,000 connections become the dominant cost at 2,000,000 [5].
+Rick Reed's talk describes patching the BEAM emulator itself (timer wheel, timer hash table) and tuning the FreeBSD kernel — raising socket limits (`kern.ipc.maxsockets`), enlarging the TCP hash table, backporting a cheaper TSC timecounter and the `igb` network driver. At that density, contention issues that are invisible at 10,000 connections become the dominant cost at 2,000,000 [5].
 
 By 2014 the fleet-wide average had settled closer to 1 million connections per server, a deliberate step back from the theoretical peak, trading some density for headroom and stability, spread across roughly 550 boxes and 11,000 cores for ~465 million monthly users [6].
 
@@ -524,16 +637,16 @@ Deduplication (matching on a sender-generated message ID, discussed in the failu
 
 Text messages are small and fit comfortably down the same persistent connection used for routing and receipts. Photos, videos, and voice notes don't.
 
-The practical pattern (consistent with WhatsApp's own minimal-server-storage principle, though the exact pipeline isn't publicly documented in full) is to separate the *pointer* from the *payload*:
+The pattern, documented in WhatsApp's security whitepaper [2], separates the *pointer* from the *payload*:
 
 1. The client encrypts the file itself client-side.
 2. It uploads the encrypted blob once to dedicated media storage.
-3. It sends a small message down the normal real-time path containing just a media URL, the decryption key, and a hash of the file for integrity checking.
+3. It sends a small encrypted message down the normal real-time path containing a pointer to the blob, the AES key, the HMAC key, and a SHA256 hash of the encrypted blob [2].
 4. The recipient's client fetches and decrypts the actual bytes separately, out of band from message routing.
 
 This keeps the connection-server fleet doing what it's tuned for — huge numbers of tiny, latency-sensitive messages — while a differently-tuned storage/CDN tier handles the comparatively rare, large, throughput-sensitive transfers.
 
-> Note: this is a simplified reference design for the media path specifically; WhatsApp has not published its literal media storage architecture. The "encrypt once, send a pointer" shape is a standard pattern for exactly this problem — a small control-plane message paired with a large out-of-band payload — and is consistent with WhatsApp's stated principle of not storing more than it has to.
+> Note: the client-side steps above come from the whitepaper [2]; WhatsApp has not published the storage/CDN architecture behind its blob store.
 
 ### Group messaging at scale: Sender Keys, re-keying, and Communities
 
@@ -545,9 +658,9 @@ After that one-time distribution, sending a group message is cheap — the sende
 
 The sharp edge is membership changes: when someone is removed from a group, every remaining member's Sender Key has to be considered compromised and thrown away, and the group effectively "starts over" — every member generates a fresh Sender Key and redistributes it to everyone else [15].
 
-That re-keying cost is one practical reason group size is capped (1,024 members) rather than unbounded: a removal in a very large group would trigger a proportionally large burst of re-keying traffic all at once [15], [16].
+That re-keying cost is plausibly one reason group size is capped (1,024 members) rather than unbounded — a removal in a very large group triggers a proportionally large burst of re-keying traffic (inference; the sources don't give the cap's reason) [15], [16].
 
-Communities (2022) don't introduce a new encryption primitive — they're a product-level wrapper around groups you already have: one announcement group broadcasting to everyone, plus up to 100 member sub-groups, capped at 2,000 total members per Community [13], [14].
+Communities (2022) don't introduce a new encryption primitive — they're a product-level wrapper around groups you already have: one announcement group broadcasting to everyone, plus the member sub-groups [13], [14] (the widely quoted 100-group / 2,000-member caps are not stated in those posts — unverified).
 
 Architecturally it reuses the same group machinery rather than inventing a new one, which is a reasonable read of why it shipped as a relatively fast follow rather than requiring years of protocol work the way multi-device did.
 
@@ -588,7 +701,7 @@ WhatsApp hasn't published which choice it makes, but the fact that the system is
 **The entire company goes dark for six hours (October 4, 2021).**
 - *Trigger:* not a WhatsApp-specific bug at all — this is the most instructive real-world outage involving WhatsApp on record precisely because it shows a failure mode *above* the messaging architecture. A routine configuration change to Meta's backbone network caused Facebook's data centers to withdraw their BGP route announcements for the IP ranges hosting their own DNS servers.
 - *What happens:* once those routes vanished, DNS resolvers worldwide could no longer find Facebook's, Instagram's, or WhatsApp's nameservers at all — not slow, not erroring, just unreachable — so client apps and websites alike failed at the very first step of trying to connect [9], [10].
-- *Why it took hours, not minutes, to fix:* recovery required physically re-establishing network access to run the fix, because the automation and monitoring tools that would normally do it also depended on the very network that had just disappeared [10].
+- *Why it took hours, not minutes, to fix:* recovery required physically re-establishing network access to run the fix, because the automation and monitoring tools that would normally do it also depended on the very network that had just disappeared; service returned after a team got access to servers in the Santa Clara data center [9].
 - *The generalizable lesson:* a system can have a beautifully fault-tolerant application layer (Erlang supervisor trees, offline queues, redundant data centers) and still go fully dark if the *network layer underneath all of it* — DNS and routing — has a single point of failure.
 
 **A message gets delivered twice, or arrives out of order.**
@@ -617,10 +730,10 @@ WhatsApp hasn't published which choice it makes, but the fact that the system is
 | No server-side message store | Minimizes what a breach or subpoena could expose; server never needs to be a message archive | Users must manage their own backups (e.g., encrypted cloud backup) for history; a lost device with no backup loses history |
 | Per-device identity keys (multi-device, 2021) | Removes the phone as a mandatory "source of truth"; companion devices work even if the phone is off [1] | Sender does more encryption work per message (one ciphertext per device) and the server must track a device list per account [1] |
 | Signal Protocol (X3DH + Double Ratchet + Sender Keys) | Forward secrecy and deniability; industry-vetted design shared with Signal | Group encryption (Sender Keys) is weaker on forward secrecy than pairwise Double Ratchet, a known trade-off of the scheme [2] |
-| Mnesia for connection routing | In-memory, distributed, and native to Erlang — fast lookups of "which server holds this session" [6] | Mnesia's scaling ceiling shaped WhatsApp's partitioning scheme (16 partitions in the 2014 setup) [6] |
+| Mnesia for connection routing *(routing use is inference; [6] documents Mnesia but not as the routing table)* | In-memory, distributed, and native to Erlang — fast lookups of "which server holds this session" [6] | Mnesia's scaling ceiling shaped WhatsApp's partitioning scheme (16 partitions in the 2014 setup) [6] |
 | Relay service on CDN PoPs, separate from signaling | Physical proximity to users cuts call latency; lets the two services scale independently [8] | Extra operational surface: two coordinated services instead of one, and mid-call cluster reselection logic to handle |
 | Sender Keys for group encryption instead of pairwise Double Ratchet per member | Sending a group message stays cheap on the sender's side instead of growing with member count [15] | Removing a member forces a full group re-key — everyone generates and redistributes a new key — all at once [15] |
-| Capped group (1,024) and Community (2,000) sizes | Keeps fan-out cost and re-key bursts bounded and predictable [16] | Large organizations/communities that want a single unbounded group have to split across multiple linked groups instead |
+| Capped group (1,024) and Community (2,000, unverified) sizes | Keeps fan-out cost and re-key bursts bounded and predictable (inference) [16] | Large organizations/communities that want a single unbounded group have to split across multiple linked groups instead |
 | Push notifications delegated to Apple/Google rather than built in-house | Waking a fully-closed app on iOS/Android requires OS-level cooperation no third party can replicate | WhatsApp's "wake the app" reliability is partly dependent on a system it doesn't control |
 | Media sent as an out-of-band blob plus an in-band pointer message | Keeps the latency-tuned real-time connection tier from also having to be a high-throughput file-transfer tier | Two systems to keep consistent — the pointer must always resolve to a blob that's actually still there — instead of one |
 | Dual-datacenter deployment for the routing tier | A single site is a single point of failure for the whole in-memory routing table [6] | Requires a consistency-vs-availability choice during any cross-site network partition |
@@ -645,10 +758,12 @@ WhatsApp hasn't published which choice it makes, but the fact that the system is
 
 ## Glossary
 
+New to these terms? The [concepts](../concepts/README.md) folder explains the core ideas in depth.
+
 - **Erlang**: a programming language built by Ericsson in the 1980s for telephone switches that must never go down. Good at running huge numbers of small, isolated, crash-tolerant tasks at once.
 - **BEAM**: the virtual machine that runs Erlang code. It can juggle millions of lightweight "processes" (not OS processes — much cheaper) on one machine.
 - **FreeBSD**: a Unix-like operating system WhatsApp ran its servers on, chosen and heavily tuned for handling huge numbers of network connections per box.
-- **Process-per-connection**: giving every single user's connection its own isolated worker inside the server, so one user's problem can't crash another user's session.
+- **[Process-per-connection](../concepts/persistent-connections.md)**: giving every single user's connection its own isolated worker inside the server, so one user's problem can't crash another user's session.
 - **Supervisor tree**: an Erlang pattern where a "supervisor" process watches over worker processes and automatically restarts any that crash, instead of letting the crash spread.
 - **Mnesia**: a database built into Erlang, kept in RAM, used here to track "which server is currently holding this user's connection."
 - **Signal Protocol**: the specific set of encryption techniques (from Signal/Open Whisper Systems) that WhatsApp uses so only the sender and recipient can read a message — not even WhatsApp's own servers can.
@@ -659,13 +774,13 @@ WhatsApp hasn't published which choice it makes, but the fact that the system is
 - **Double Ratchet**: a technique that changes the encryption key for every single message, so if one message's key ever leaked, it wouldn't expose any other message.
 - **Forward secrecy**: the property that losing today's keys doesn't let an attacker decrypt yesterday's messages.
 - **Sender Keys**: a group-chat shortcut where the sender encrypts a message once with one shared key for the whole group, instead of once per member — faster, at the cost of some of the Double Ratchet's guarantees.
-- **Client-fanout**: encrypting and sending a separate copy of a message for each of the recipient's devices, done on the sender's device rather than the server.
+- **[Client-fanout](../concepts/fan-out.md)**: encrypting and sending a separate copy of a message for each of the recipient's devices, done on the sender's device rather than the server.
 - **Multi-device**: letting a WhatsApp account be used from several devices (phone + linked desktop/web/tablet) at once, each with its own encryption identity.
-- **Offline queue**: a small mailbox on the server holding a user's undelivered messages until they reconnect.
+- **[Offline queue](../concepts/message-queues-and-logs.md)**: a small mailbox on the server holding a user's undelivered messages until they reconnect.
 - **Delivery/read receipt**: the check-marks in the UI — one gray check (server received it), two gray checks (device received it), two blue checks (user opened it).
 - **Push notification**: a message sent by Apple (APNs) or Google (FCM), not WhatsApp, that wakes up a phone so a fully-closed app can reconnect.
 - **App state sync**: keeping non-message data (contact names, archived chats, settings) the same across a user's own devices, encrypted so the server can store it without reading it.
-- **PoP (point-of-presence)**: a smaller edge data center, closer to users than a company's main data centers, used to cut network latency.
+- **[PoP (point-of-presence)](../concepts/cdn.md)**: a smaller edge data center, closer to users than a company's main data centers, used to cut network latency.
 - **Signaling (in calling)**: the control-plane work of setting up a call — ringing, accepting, exchanging connection info — as opposed to the media itself.
 - **NACK (negative acknowledgement)**: a receiver telling the sender "I didn't get packet #N," used to selectively re-send only what's missing instead of the whole stream.
 - **Simulcast**: sending more than one quality level of the same video stream at once, so a relay can forward whichever one fits each recipient's available bandwidth.
@@ -673,7 +788,7 @@ WhatsApp hasn't published which choice it makes, but the fact that the system is
 - **DNS (Domain Name System)**: the internet's "phone book," translating a name like whatsapp.com into an IP address; if DNS can't be reached, most apps can't even start connecting.
 - **Communities**: a WhatsApp feature that bundles multiple related groups (up to 100) under one announcement channel, for organizations like schools or neighborhoods.
 - **Re-keying**: throwing away a shared group encryption key and generating a fresh one, done whenever someone is removed from a group so they can no longer decrypt future messages.
-- **Network partition / split brain**: a failure where two halves of a distributed system can each still talk to their own members but not to each other, and each mistakenly believes it's the only one still running.
+- **[Network partition / split brain](../concepts/cap-and-consistency.md)**: a failure where two halves of a distributed system can each still talk to their own members but not to each other, and each mistakenly believes it's the only one still running.
 - **Reference-counted storage**: storing one copy of a piece of data and just tracking how many things still point to it, instead of duplicating it for every recipient.
 - **Metadata (in messaging)**: information *about* a message — who sent it, to whom, when, roughly how big it was — as distinct from the message's actual content.
 
@@ -694,4 +809,4 @@ WhatsApp hasn't published which choice it makes, but the fact that the system is
 13. [Sharing Our Vision for Communities on WhatsApp](https://blog.whatsapp.com/sharing-our-vision-for-communities-on-whatsapp) — WhatsApp Blog, April 2022.
 14. [Communities Now Available!](https://blog.whatsapp.com/communities-now-available) — WhatsApp Blog, November 2022.
 15. [Sender Keys](https://en.wikipedia.org/wiki/Sender_Keys) — Wikipedia, describing the Signal Protocol's group-messaging key scheme used by WhatsApp. *(third-party)*
-16. Group and Community size limits (1,024 members / 100 groups / 2,000 members) as reported across [13] and [14].
+16. Group size limit (1,024 members) as reported in [14]. The 100-group / 2,000-member Community limits are not stated in [13] or [14].

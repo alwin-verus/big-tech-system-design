@@ -41,7 +41,7 @@ company's searchable work record.
 
 | Dimension | WhatsApp | Discord | Slack |
 |---|---|---|---|
-| Main unit of conversation | 1:1 chats and groups, groups capped at 1,024 members | A "guild" (Discord's internal name for a server) with channels, up to 10M+ members | A workspace with channels, largest documented at 160,000 users |
+| Main unit of conversation | 1:1 chats and groups, groups capped at 1,024 members | A "guild" (Discord's internal name for a server) with channels, up to 10M+ members | A workspace with channels; largest documented customers have 160,000+ active users |
 | Who holds your connection | One Erlang process per connection on FreeBSD, ~1M connections per server (2014) | One Elixir "session" process per connection, plus one process per guild | A Gateway Server at the network edge, near you |
 | How a message is routed | Look up the recipient's server in Mnesia, an in-memory database built into Erlang | The guild's process hands the event to Manifold, which relays it through one worker per node | Consistent hashing sends it to the one Channel Server that owns that channel |
 | What is stored | No message archive. Undelivered ciphertext is deleted after delivery | Every message, forever, in ScyllaDB (trillions) | Every message, in MySQL sharded through Vitess |
@@ -74,7 +74,7 @@ concurrency model](../companies/whatsapp.md#the-erlangbeam-concurrency-model-and
 
 **Slack split the job across two kinds of server instead.** A **Gateway Server** holds your
 WebSocket and remembers which channels you care about. It is deployed in edge regions, physically
-close to users. A **Channel Server** holds the source of truth for a slice of channels and lives in
+close to users. A **Channel Server** owns a slice of channels (holding their recent history in memory) and lives in
 Slack's main region. The client connects to the nearest Gateway Server through Envoy, a network
 proxy used as a load balancer (see [Slack: Channel Servers and Gateway
 Servers](../companies/slack.md#channel-servers-and-gateway-servers-separating-storage-of-truth-from-the-edge)).
@@ -108,10 +108,11 @@ The trade-off in one line each:
 When your message lands on server A, something must answer "which server holds the recipient right
 now?"
 
-- **WhatsApp** keeps a shared **routing table** in Mnesia: "user X is connected to server Y".
-  Because Mnesia lives in RAM and is replicated, the lookup is a same-datacenter memory read, not a
-  trip to a separate database. In 2014 the table was about 2TB of RAM, split into 16 partitions,
-  holding 18 billion records (see [WhatsApp: high-level
+- **WhatsApp** keeps a shared **routing table**, likely in Mnesia (reference design; the source
+  documents Mnesia and a pg2-based routing layer, not Mnesia as the routing table): "user X is
+  connected to server Y". Because Mnesia lives in RAM and is replicated, the lookup is a
+  same-datacenter memory read, not a trip to a separate database. In 2014 the Mnesia database was
+  about 2TB of RAM, split into 16 partitions, holding 18 billion records (see [WhatsApp: high-level
   design](../companies/whatsapp.md#high-level-design)).
 - **Discord** does not look up individual users per message. The guild process already knows its
   online members' sessions. Its problem is the next step, fan-out (Dimension 3).
@@ -163,8 +164,8 @@ flow](../companies/whatsapp.md#1-core-flow-sending-an-encrypted-message-to-a-mul
 For groups, one copy per member device would be far too much work, so groups use **Sender Keys**:
 each member shares one symmetric key with the group once, then encrypts each group message a single
 time. The sharp edge is removing a member. Every remaining member's key must be thrown away and
-redistributed, a burst of work that grows with group size. That re-keying cost is one practical
-reason groups are capped at 1,024 members and Communities at 2,000 (see [WhatsApp: group messaging
+redistributed, a burst of work that grows with group size. That re-keying cost is plausibly one
+reason (inference) groups are capped at 1,024 members (see [WhatsApp: group messaging
 at scale](../companies/whatsapp.md#group-messaging-at-scale-sender-keys-re-keying-and-communities)).
 
 **Discord: fan-out is the whole engineering story.** A guild process that sends to each member one
@@ -175,12 +176,12 @@ flow](../companies/discord.md#1-core-flow-sending-a-message-in-a-large-guild)).
 
 Discord's fixes came in two rounds:
 
-1. **Manifold (2017).** Group the recipients by which of ~20 remote nodes they are connected to,
+1. **Manifold (2017).** Group the recipients by which remote node they are connected to,
    send one message per node, and let a worker on that node deliver locally. Local delivery inside
    one machine is cheap. The guild process now does a small, fixed amount of work no matter how big
    the guild is (see [Discord: Manifold's hierarchical
    fan-out](../companies/discord.md#3-signature-component-manifolds-hierarchical-fan-out)).
-2. **Maxjourney (2022).** For a guild with 10 million members and 1 million online, Discord added
+2. **Maxjourney (written up 2023).** For a guild with 10 million members and 1 million online, Discord added
    **passive sessions**: if you are not looking at that server right now, you get a slimmed-down
    update stream instead of every event. Discord reports this cut fan-out work by roughly 90%. It
    also added more **relay** processes, each handling up to 15,000 sessions (see [Discord:
@@ -195,7 +196,7 @@ out](../companies/slack.md#1-core-flow-posting-a-message-and-fanning-it-out)).
 | | WhatsApp | Discord | Slack |
 |---|---|---|---|
 | Who pays for fan-out | The sender's phone (encryption) | The guild's node, split across relays | The Channel Server (per gateway), then gateways (per socket) |
-| What limits group size | Re-keying burst on member removal, so hard caps | Fan-out cost, attacked with relays and passive sessions | Not a stated cap; largest documented workspace is 160,000 users |
+| What limits group size | Hard cap of 1,024; re-keying burst on removal is a plausible reason (inference) | Fan-out cost, attacked with relays and passive sessions | Not a stated cap; largest documented customers have 160,000+ active users |
 | Key trick | Sender Keys: encrypt once per group | Batch by destination node, then deliver locally | Subscribe gateways to channels, not sockets to channels |
 
 ## Dimension 4: what the server stores
@@ -335,7 +336,7 @@ are fully offline, Slack's job queue sends a push notification.
 
 | | WhatsApp | Discord | Slack |
 |---|---|---|---|
-| Incident | Oct 4, 2021, all of Meta dark for about six hours | Mar 25, 2026 voice and video outage, 3h17m | Jan 4, 2021 global outage, about five hours |
+| Incident | Oct 4, 2021, all of Meta dark for about six hours | Mar 25, 2026 voice and video outage, 3h17m | Jan 4, 2021 global outage, about four hours (6:57–10:40 AM PST) |
 | Trigger | A backbone config change withdrew **BGP** routes (how internet routers learn where addresses live) for Meta's **DNS** servers (the internet's name-to-address phone book) | A routine Kubernetes config change killed 50% of session pods in one zone at once, dropping about 17% of sessions | An AWS Transit Gateway (network plumbing between Slack's networks) saturated as everyone returned from holidays |
 | Why it got worse | The tools to fix it needed the same network that had vanished | Voice-routing processes built up mailboxes of about a million messages and could not drain | Autoscaling saw idle CPU and removed servers; the provisioning service hit its own limits |
 | Lesson | A perfect app layer still dies if the network layer under it fails | One routine change cascaded through four systems with no graceful degradation | Automation that assumes a healthy network can make a network problem worse |
@@ -362,7 +363,7 @@ ground under them moved.
   same problem with a product cap.
 - **Customer shape decides shard key.** Slack sharded by workspace because B2B customers were
   natural units. It broke only when a few customers each outgrew one database server.
-- **Era and team.** WhatsApp chose Erlang in 2009 and ran on a ~50-person engineering org at
+- **Era and team.** WhatsApp chose Erlang in 2009 and ran with about 10 Erlang engineers at
   acquisition. Discord started in 2015 on Elixir, the same VM with newer tooling, and ran its chat
   infrastructure with about five engineers. Slack started in 2013 on PHP and MySQL, the mainstream
   web stack of its day.

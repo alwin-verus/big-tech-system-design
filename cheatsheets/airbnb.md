@@ -27,10 +27,10 @@ flowchart LR
 
 | Metric | Number | Source |
 |---|---|---|
-| Active listings | ~9M (2025) | [Airbnb Statistics — DemandSage](https://www.demandsage.com/airbnb-statistics/) |
-| Nights + Experiences booked | 492M (2024) | [Airbnb Statistics — DemandSage](https://www.demandsage.com/airbnb-statistics/) |
+| Active listings | ~8M (2025); 9.5M+ (2026) | [Airbnb Statistics — DemandSage](https://www.demandsage.com/airbnb-statistics/) |
+| Nights + Experiences booked | 393.7M (2022) | [Airbnb Statistics — DemandSage](https://www.demandsage.com/airbnb-statistics/) |
 | Payment countries / currencies supported | 191 countries, 70+ currencies | [Scaling Airbnb's Payment Platform](https://medium.com/airbnb-engineering/scaling-airbnbs-payment-platform-43ebfc99b324) |
-| Engineers (2015 to 2018) | ~90 to 1,000+ | [Airbnb's Great Migration — QCon SF 2018](https://www.infoq.com/presentations/airbnb-soa-migration/) |
+| Engineers (2014 to 2018) | ~90 to ~1,000 | [Airbnb's Great Migration — QCon SF 2018](https://www.infoq.com/presentations/airbnb-soa-migration/) |
 | Services on the SOA IDL framework (2018) | 250+ | [Airbnb's Great Migration — QCon SF 2018](https://www.infoq.com/presentations/airbnb-soa-migration/) |
 | Weekly production deploys (before to after SOA) | ~3,000 to ~10,000 | [Airbnb's Great Migration — QCon SF 2018](https://www.infoq.com/presentations/airbnb-soa-migration/) |
 | Blocked-deploy time on Monorail (~200 engineers, 2015) | ~15 hours/week average | [Airbnb's Great Migration — QCon SF 2018](https://www.infoq.com/presentations/airbnb-soa-migration/) |
@@ -41,14 +41,14 @@ flowchart LR
 - **Data-ownership rule in the SOA** — only the owning service writes its own tables; everyone else calls its API.
 - **Orpheus idempotency framework (pre-RPC / RPC / post-RPC phases)** — got Airbnb to "five nines" of payment consistency despite external processors that don't support 2PC.
 - **Domain-decomposed payments platform (pay-in, payout, ledger, settlement)** — lets country/processor teams ship independently across 191 countries.
-- **Two-tower embedding retrieval (IVF over HNSW) + two-stage GBDT-then-DNN ranking** — IVF chosen specifically because it tolerates Airbnb's real-time listing-update rate.
-- **Viaduct federated GraphQL** — one schema, but each backend team owns its own module, so ownership stays decentralized even though the query layer is unified.
+- **Two-tower embedding retrieval (IVF over HNSW) + GBDT ranking later replaced by a DNN** — IVF chosen specifically because it tolerates Airbnb's real-time listing-update rate.
+- **Viaduct central-schema GraphQL** — one schema served by a shared multi-tenant runtime, but each backend team owns its own module, so ownership stays decentralized even though the query layer is unified.
 
 ## If an interviewer asks "design Airbnb"
 
 1. Clarify scope: search/rank listings, guarantee no double-booking, capture guest payment, pay the host out later, across 191 countries.
 2. Split reads that can be stale (search) from the one write that can't (availability) — they need different consistency models.
-3. Retrieval narrows millions of listings via keyword/geo index plus embedding-based retrieval, then a two-stage ranking model (GBDT then DNN) orders results.
+3. Retrieval narrows millions of listings via keyword/geo index plus embedding-based retrieval, then a DNN ranking model (successor to an earlier GBDT) orders results.
 4. In the booking flow, hold the specific night(s) in a strongly-consistent Availability DB before touching payment at all.
 5. Only after the hold succeeds, call Payments through an idempotency framework: record intent, call the processor, then record the outcome.
 6. Record every money movement in an append-only, double-entry ledger, since payouts land days later, possibly in a different currency, and must be auditable.
@@ -65,7 +65,7 @@ flowchart LR
 
 ## Gotchas
 
-- The `CALENDAR_NIGHT` schema/state machine in companies/airbnb.md is a labeled reference design — Airbnb has confirmed calendar data is its own partitioned domain, not the exact schema or locking primitive.
+- The `CALENDAR_NIGHT` schema/state machine in companies/airbnb.md is a labeled reference design — Airbnb has not published its calendar partitioning, schema, or locking primitive (the partitioned-domain framing is also reference design).
 - Airbnb explicitly does not call its architecture "microservices" — it calls it SOA, on purpose, with more shared libraries than pure microservices would use.
 - The FX/ledger-adjustment scenario in "what happens when things break" is a reasonable inference from the documented delayed multi-currency payout model, not a confirmed internal mechanic.
-- Don't confuse Viaduct (federated GraphQL, 2019+) with the SOA migration itself (2015-2018) — Viaduct exists specifically to fix the integration tax the SOA migration created.
+- Don't confuse Viaduct (central-schema GraphQL, 2019+) with the SOA migration itself (2015-2018) — Viaduct exists specifically to fix the integration tax the SOA migration created.

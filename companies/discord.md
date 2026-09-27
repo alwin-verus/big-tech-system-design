@@ -17,6 +17,7 @@
 - [Before you read: design it yourself](#before-you-read-design-it-yourself)
 - [The problem](#the-problem)
 - [Scale](#scale)
+- [Back-of-the-envelope math](#back-of-the-envelope-math)
 - [Requirements](#requirements)
 - [How it evolved](#how-it-evolved)
 - [High-level design](#high-level-design)
@@ -44,7 +45,7 @@ Think about what "the guild process sends to every member directly" costs once "
 <details>
 <summary>How Discord does it</summary>
 
-Before 2017 the guild process really did send directly to every session, taking 900ms–2.1s to fan out in a 30,000-concurrent-member guild. Manifold fixed it by grouping recipients by which of ~20 remote nodes they're connected to, sending one message per node, and letting a relay worker on that node fan out locally (cheap, same-node sends). That turns an O(members) cost on the guild process into a small, roughly constant one.
+Before 2017 the guild process really did send directly to every session, taking 900ms–2.1s to fan out in a 30,000-concurrent-member guild. Manifold fixed it by grouping recipients by which remote node they're connected to, sending one message per node, and letting a relay worker on that node fan out locally (cheap, same-node sends). That turns an O(members) cost on the guild process into a small, roughly constant one.
 
 Deep dive: [Manifold's hierarchical fan-out](#3-signature-component-manifolds-hierarchical-fan-out).
 
@@ -98,7 +99,7 @@ Think about separating "who's in the call" (small, must survive) from "the actua
 <details>
 <summary>How Discord does it</summary>
 
-Voice signaling (Elixir, same real-time model as text) is a separate service from the actual media relay: a custom C++ Selective Forwarding Unit that just forwards each participant's encrypted stream without decoding or mixing it, with a trimmed-down WebRTC handshake (no ICE, ~1,200-byte SDP instead of ~10KB). When that separation isn't enough — March 25, 2026, a routine Kubernetes config change killed half the session-management pods in one zone at once — the failure cascaded through Gateway memory exhaustion and a million-message voice-syncer backlog, taking over three hours to recover from, precisely because none of the intermediate systems had a graceful-degradation plan for "a large chunk of my peers just disappeared."
+Voice signaling (Elixir, same real-time model as text) is a separate service from the actual media relay: a custom C++ Selective Forwarding Unit that just forwards each participant's encrypted stream without decoding or mixing it, with a trimmed-down WebRTC handshake (no ICE, under ~1,200 bytes exchanged round trip). When that separation isn't enough — March 25, 2026, a routine Kubernetes config change killed half the session-management pods in one zone at once — the failure cascaded through Gateway memory exhaustion and a voice-syncer mailbox backlog, taking over three hours to recover from, precisely because none of the intermediate systems had a graceful-degradation plan for "a large chunk of my peers just disappeared."
 
 Deep dive: [Voice infrastructure: a homegrown SFU and a trimmed-down WebRTC](#voice-infrastructure-a-homegrown-sfu-and-a-trimmed-down-webrtc) and [What happens when things break](#what-happens-when-things-break).
 
@@ -132,7 +133,7 @@ This page tries to answer three questions a junior engineer should walk away abl
 |---|---|---|
 | Concurrent users (chat infrastructure) | 5 million (2017) | [1] |
 | Monthly active users | 100 million+ (Oct 2020) | [9] |
-| Monthly active users | 200 million+ (2023–2024) | [13] *(third-party)* |
+| Monthly active users | 200 million (2023, estimate) | [13] *(third-party)* |
 | Minutes spent in conversation per day | 4 billion (Oct 2020) | [9] |
 | Active servers/communities | 6.7 million (Oct 2020) | [9] |
 | Concurrent users across all servers | 12 million+ (Oct 2020) | [9] |
@@ -152,12 +153,12 @@ This page tries to answer three questions a junior engineer should walk away abl
 | Concurrent voice users | 2.6 million | [6] |
 | Voice egress traffic | 220+ Gbit/s, 120 million packets/sec | [6] |
 | Elasticsearch clusters (search v2) | 40 clusters, thousands of indices | [7] |
-| Search query latency | p50 <100ms, p95/p99 <500ms (down from 500ms / 1s on v1) | [7] |
+| Search query latency | p50 <100ms, p99 <500ms (down from 500ms / 1s on v1) | [7] |
 | Read States tracked | billions total; tens of millions per cache; later capacity raised to 8 million per cache | [4] |
 | Read State cache updates/sec | hundreds of thousands | [4] |
 | Read State database writes/sec | tens of thousands | [4] |
 | Voice outage, March 25, 2026 | 17% of sessions lost, 3h17m total duration | [8] |
-| Registered accounts | 750 million+ (2026) | [13] *(third-party)* |
+| Registered accounts | 560 million (2023) | [13] *(third-party)* |
 
 What these numbers mean in practice:
 
@@ -171,7 +172,115 @@ What these numbers mean in practice:
 
 - The ScyllaDB cutover ran at 3.2 million records/sec for a 9-day migration.
 
-  That gap between a raw hardware ceiling and an actually-achieved number shows the difference between what's theoretically possible and a well-engineered, verified migration tool built by a small team in about a day of focused work [3].
+  That gap between a raw hardware ceiling and an actually-achieved number shows the difference between what's theoretically possible and a well-engineered, verified migration tool the team built by extending its data-service library in an afternoon [3].
+
+## Back-of-the-envelope math
+
+Back-of-the-envelope math is the rough, order-of-magnitude estimating engineers do on a whiteboard — no calculator, no precise data, just enough arithmetic to check whether a design idea is remotely plausible before building it. Inputs marked **[n]** come straight from this page's [Scale](#scale) table and cite the same source; everything else is a labeled **Assumption**, not a fact.
+
+### Estimate 1: How many events does each connected user actually receive per second?
+
+**Question:** Given 26 million WebSocket events/sec sent fleet-wide, how many events does each concurrently-connected user receive on average?
+
+**Inputs:**
+- WebSocket events sent to clients/sec: 26 million (Oct 2020) [9]
+- Concurrent users across all servers: 12 million+ (Oct 2020) [9]
+
+**Math:**
+```text
+events per user per second = 26,000,000 / 12,000,000
+                            ≈ 2.17/sec
+```
+
+**Answer:** ~2 events/sec per connected user, on average.
+
+**What it tells you:** most of that traffic is small, routine events (presence, typing, member updates), not messages — exactly why fan-out has to be cheap per event rather than assumed rare, and why [Manifold](#3-signature-component-manifolds-hierarchical-fan-out) batches by destination node instead of sending one at a time.
+
+### Estimate 2: Does the pre-Manifold fan-out time actually match the per-send cost?
+
+**Question:** Discord's own account says a single Erlang `send/2` costs 30-70 microseconds, and that fanning out to a 30,000-member guild took 900ms-2.1s. Do those two numbers actually agree?
+
+**Inputs:**
+- Guild size in the documented pre-Manifold example: ~30,000 concurrent members [1]
+- Cost of one Erlang `send/2`: 30-70 microseconds [1]
+
+**Math:**
+```text
+low end  = 30,000 sends × 30 µs/send = 900,000 µs = 0.9 s
+high end = 30,000 sends × 70 µs/send = 2,100,000 µs = 2.1 s
+```
+
+**Answer:** 0.9s-2.1s — matches the documented range exactly.
+
+**What it tells you:** confirms the guild process really was doing one direct, serial send per member before Manifold existed — the concrete reason [Manifold's hierarchical fan-out](#3-signature-component-manifolds-hierarchical-fan-out) had to exist at all, rather than a vaguer "it was slow."
+
+### Estimate 3: How much total data moved during the Cassandra → ScyllaDB migration?
+
+**Question:** Roughly how much total message data was Discord storing right before and right after the 2022 migration?
+
+**Inputs:**
+- Cassandra cluster size: 177 nodes (early 2022) [3]
+- Storage per node: ~4TB avg (Cassandra) [3]
+- ScyllaDB cluster size (post-migration): 72 nodes [3]
+- Storage per node: 9TB (ScyllaDB) [3]
+
+**Math:**
+```text
+Cassandra total ≈ 177 nodes × 4 TB/node  = 708 TB
+ScyllaDB total  ≈ 72 nodes  × 9 TB/node  = 648 TB
+```
+
+**Answer:** ~700TB (Cassandra) vs. ~650TB (ScyllaDB) — roughly the same data, on 59% fewer nodes.
+
+**What it tells you:** quantifies the "same data, way fewer nodes" payoff described in [From MongoDB to Cassandra to ScyllaDB](#from-mongodb-to-cassandra-to-scylladb-three-databases-in-under-a-decade) — the migration wasn't about storing more, it was about storing the same amount for less operational cost.
+
+### Estimate 4: How many messages can the 2025 Search v2 architecture actually index?
+
+**Question:** Given ~40 Elasticsearch clusters with "thousands of indices," each capped at roughly 200 million messages, does that plausibly reach the "trillions of messages" the requirements call for?
+
+**Inputs:**
+- Elasticsearch clusters (search v2): 40 clusters, thousands of indices [7]
+- Per-index cap: ~200 million messages / ~50GB (see [Search infrastructure](#search-infrastructure-from-two-clusters-to-forty)) [7]
+- Assumption: ~5,000 indices total — the middle of the page's "thousands of indices" description.
+
+**Math:**
+```text
+total capacity ≈ 5,000 indices × 200,000,000 messages/index
+              = 1,000,000,000,000
+              = 1 × 10^12 messages ≈ 1 trillion messages
+```
+
+**Answer:** ~1 trillion+ messages of index capacity, at the assumed index count.
+
+**What it tells you:** shows why sharding into many small indices — instead of one giant one — is what makes reaching that total scale possible at all without ever touching Lucene's ~2-billion-document-per-index ceiling; see [Search infrastructure: from two clusters to forty](#search-infrastructure-from-two-clusters-to-forty).
+
+### Estimate 5: How much bandwidth does one concurrent voice user actually use?
+
+**Question:** Given 220+ Gbit/s of total voice egress and 2.6 million concurrent voice users, what's the average bandwidth per user?
+
+**Inputs:**
+- Voice egress traffic: 220+ Gbit/s [6]
+- Concurrent voice users: 2.6 million [6]
+
+**Math:**
+```text
+bandwidth per user = 220,000,000,000 bits/s / 2,600,000 users
+                    ≈ 84,615 bits/s ≈ 85 Kb/s
+```
+
+**Answer:** ~85 Kb/s average egress per concurrent voice user.
+
+**What it tells you:** that's in line with a single compressed voice-only stream (Opus typically runs 64-96 Kb/s), consistent with the SFU relaying mostly-audio without needing large per-user bandwidth headroom — see [Voice infrastructure: a homegrown SFU and a trimmed-down WebRTC](#voice-infrastructure-a-homegrown-sfu-and-a-trimmed-down-webrtc).
+
+### Rules of thumb used
+
+| Rule | Value |
+|---|---|
+| 1 day | ~86,400 s ~ 10^5 s |
+| 1 TB | ~10^12 bytes |
+| Peak vs. average load | typically ~2-3x, though a single viral event can be far higher |
+
+These are general estimating conventions, not Discord-specific facts.
 
 ## Requirements
 
@@ -188,22 +297,22 @@ What these numbers mean in practice:
 - **Storage has to keep scaling past trillions of messages** without the operational burden (compaction, repairs, GC pauses) growing faster than the team that runs it [3].
 - **A crash in one guild, one session, or one voice server should not cascade** to unrelated guilds, sessions, or calls — isolation is a first-class requirement given the BEAM-based architecture.
 - **Search has to stay fast at massive scale** without any single index growing past what its underlying engine (Lucene, inside Elasticsearch) can hold [7].
-- **A small team has to be able to operate all of this.** Discord's chat infrastructure was run by roughly five engineers even at 5-million-concurrent scale [1], [9] — tooling and observability investment is treated as a first-class requirement, not a nice-to-have.
+- **A small team has to be able to operate all of this.** Five engineers were responsible for 20+ Elixir services even at 12-million-concurrent scale (2020) [9] — tooling and observability investment is treated as a first-class requirement, not a nice-to-have.
 
 ## How it evolved
 
 ```mermaid
 timeline
   title Discord backend timeline
-  2015 : Founded, Elixir plus Python monolith, single MongoDB replica set for messages
+  2015 : Founded, Elixir real time plus Python API monolith, single MongoDB replica set for messages
   2015 : November, 100 million stored messages, MongoDB can no longer fit data and index in RAM
   2016 : Migration to Cassandra, 12 node cluster, bucketed by channel id and time
   2017 : Manifold, FastGlobal, Semaphore libraries ship to reach 5 million concurrent users
   2017 : Elasticsearch v1 search ships, two clusters, billions of messages
   2020 : Read States service rewritten from Go to Rust to eliminate GC latency spikes
-  2021 : Custom C plus plus SFU voice infrastructure documented at 2.6 million concurrent voice users
+  2018 : Custom C plus plus SFU voice infrastructure documented at 2.6 million concurrent voice users
   2022 : Cassandra cluster reaches 177 nodes, migration to ScyllaDB begins
-  2022 : Maxjourney project ships passive sessions and relay system for 1 million plus online in one guild
+  2023 : Maxjourney write up, passive sessions and relays for 1 million plus online in one guild
   2022 : Production switchover from Cassandra to ScyllaDB completed in May
   2025 : Elasticsearch search v2 ships, multi cluster cell architecture, trillions of messages
   2026 : March 25 voice outage and postmortem drive Kubernetes admission webhook and graceful draining fixes
@@ -217,9 +326,9 @@ The *storage* layer went through three different databases in under a decade.
 
 And the specialty systems (voice, search) were each built once and then substantially rebuilt as scale outgrew the first version.
 
-**2015 — the honest starting point.** Discord launched as an Elixir-and-Python monolith with a single MongoDB replica set holding every message, indexed on `channel_id` and `created_at` [2].
+**2015 — the honest starting point.** Discord launched with Elixir for real-time and a Python REST monolith [9], and a single MongoDB replica set holding every message, indexed on `channel_id` and `created_at` [2].
 
-By November 2015, at just 100 million stored messages, the data and its index could no longer fit in RAM, and write performance fell apart [2]. This is the same story nearly every company in this series tells at some point: the simplest possible thing worked, until it very suddenly didn't.
+By November 2015, at just 100 million stored messages, the data and its index could no longer fit in RAM, and latencies became unpredictable [2]. This is the same story nearly every company in this series tells at some point: the simplest possible thing worked, until it very suddenly didn't.
 
 **2016 — Cassandra, and a genuinely clever partition key.** Discord picked Cassandra for its linear scalability and self-healing replication, and — critically — changed the primary key from `(channel_id, message_id)` to `(channel_id, bucket, message_id)`.
 
@@ -233,15 +342,15 @@ Discord's answer was three purpose-built, later open-sourced libraries — **Man
 
 That collection cycle scanned tens of millions of cached entries every time, causing periodic latency spikes no amount of Go-level tuning fully eliminated [4].
 
-**2021 — documenting the voice stack at scale.** Discord published a detailed account of its custom WebRTC-based voice infrastructure — a homegrown Selective Forwarding Unit written in C++, deliberately deviating from standard WebRTC in several places for performance [6].
+**2018 — documenting the voice stack at scale.** Discord published a detailed account of its custom WebRTC-based voice infrastructure — a homegrown Selective Forwarding Unit written in C++, deliberately deviating from standard WebRTC in several places for performance [6].
 
 **2022 — outgrowing Cassandra, and building the second giant-guild system.** By early 2022 the Cassandra message cluster had grown to 177 nodes, and the operational cost — hot partitions, compaction backlogs, GC pauses, frequent on-call pages — outweighed the benefits of staying [3].
 
-Discord migrated to ScyllaDB, cutting node count to 72 while improving p99 latencies substantially [3]. In parallel, the "Maxjourney" project extended the 2017 fan-out work with **passive sessions** (skip sending full data to members not actively looking at a server) and a **relay system** (further layers of fan-out workers), enabling a single guild to support over a million concurrently online members [5].
+Discord migrated to ScyllaDB, cutting node count to 72 while improving p99 latencies substantially [3]. In parallel, the "Maxjourney" project extended the 2017 fan-out work with **passive sessions** (skip sending full data to members not actively looking at a server) and a **relay system** (further layers of fan-out workers), enabling a single guild to support over a million concurrently online members (written up in October 2023) [5].
 
 **2025 — search rebuilt again, for the trillions-of-messages era.** The original two-cluster Elasticsearch design from 2017 had grown to 200+ nodes with severe coordination overhead and was hitting Lucene's roughly 2-billion-document ceiling per index on the largest guilds.
 
-Discord rebuilt search as a "multi-cluster cell architecture" — 40 smaller Elasticsearch clusters on Kubernetes, each capped around 200 million messages and 50GB per index — cutting p50 query latency from 500ms to under 100ms [7].
+Discord rebuilt search as a "multi-cluster cell architecture" — 40 smaller Elasticsearch clusters on Kubernetes, with each index kept within ~200 million messages and 50GB — cutting p50 query latency from 500ms to under 100ms [7].
 
 **2026 — a reminder that even mature systems have a bad day.** A routine Kubernetes configuration change during an ongoing migration of Elixir workloads accidentally terminated a large fraction of session-management pods at once, cascading into a three-hour-plus voice/video outage — covered in detail in the failure section below [8].
 
@@ -254,7 +363,7 @@ flowchart LR
   GW --> SESS["Session process<br/>one GenServer per connection"]
   SESS --> GUILD["Guild process<br/>one GenServer per server"]
   API --> GUILD
-  GUILD -->|"Manifold fan-out"| RELAY["Relay workers on ~20 remote nodes"]
+  GUILD -->|"Manifold fan-out"| RELAY["Partitioner on each remote node"]
   RELAY --> SESS2["Session processes across the cluster"]
   API --> DS["Message data service<br/>(Rust, gRPC, Tokio)"]
   DS --> SCY[("ScyllaDB<br/>messages, bucketed by channel")]
@@ -278,7 +387,7 @@ Walking through it:
 
 3. **Fan-out doesn't talk to sessions directly.** When something happens in a guild (a new message, a presence update), the guild process doesn't send to every member's session process one by one.
 
-   Instead it hands the work to **Manifold**, which groups recipients by which of ~20 remote nodes they're connected to and routes through a relay worker on each node, turning what would be tens of thousands of expensive cross-node sends into a small, fixed number of them [1], [5].
+   Instead it hands the work to **Manifold**, which groups recipients by which remote node they're connected to and routes through a partitioner/worker on each node, turning what would be tens of thousands of expensive cross-node sends into a small, fixed number of them [1], [5].
 
 4. **Message persistence is a separate, stateless Rust tier.** Writing a message doesn't happen inside the Elixir guild process.
 
@@ -348,16 +457,16 @@ Second, the primary key evolved from `(channel_id, message_id)` to `(channel_id,
 
 ```mermaid
 flowchart TD
-  G["Guild process<br/>1 million+ online members"] -->|"naive: 1M direct sends"| Bad["900ms to 2.1s fan-out<br/>(pre-Manifold)"]
+  G["Guild process<br/>large guild"] -->|"naive: one send per session"| Bad["900ms to 2.1s fan-out<br/>(pre-Manifold, guilds up to ~30K online)"]
   G -->|"Manifold: group by destination node"| M["Manifold router"]
-  M --> N1["Relay worker, node 1<br/>~50K local sessions"]
-  M --> N2["Relay worker, node 2<br/>~50K local sessions"]
-  M --> N3["... ~20 nodes total"]
+  M --> N1["Worker, node 1<br/>its local sessions"]
+  M --> N2["Worker, node 2<br/>its local sessions"]
+  M --> N3["... one per involved node"]
   N1 --> L1["Local delivery, in-process, cheap"]
   N2 --> L2["Local delivery, in-process, cheap"]
 ```
 
-Instead of the guild process performing one expensive cross-node send per remote session, Manifold groups all the recipients on a message by which of the ~20 remote nodes they're connected to, sends **one** message per node, and lets a worker on that node fan out locally to its own sessions.
+Instead of the guild process performing one expensive cross-node send per remote session, Manifold groups all the recipients on a message by which remote node they're connected to, sends **one** message per node, and lets a worker on that node fan out locally to its own sessions.
 
 This is cheap because same-node Erlang message passing doesn't cross the network [1].
 
@@ -398,7 +507,7 @@ sequenceDiagram
   GW-->>C: Voice server address, stream id, encryption key
   C->>Voice: Minimal SDP-like handshake, under 1200 bytes round trip
   Voice-->>C: Ready
-  C->>Voice: Encrypted SRTP audio/video
+  C->>Voice: Encrypted audio/video, Salsa20 native or SRTP browser
   Voice->>Voice: SFU forwards each speaker's stream to other participants
   Voice-->>C: Forwarded streams from other speakers
 ```
@@ -407,7 +516,7 @@ Discord's voice signaling is handled in Elixir, fitting the same real-time proce
 
 It forwards each participant's encrypted stream to every other participant without decoding or mixing audio centrally.
 
-It also deliberately trims the standard WebRTC handshake: a full ICE negotiation is skipped, since the server-relay architecture removes the need for peer discovery, and the SDP-equivalent exchange is kept under roughly 1,200 bytes instead of the ~10KB a standard negotiation would use [6].
+It also deliberately trims the standard WebRTC handshake: a full ICE negotiation is skipped, since the server-relay architecture removes the need for peer discovery, and the whole exchange is kept under roughly 1,200 bytes round trip, with SDP synthesized on the client [6].
 
 ## Deep dives
 
@@ -489,7 +598,7 @@ Discord's own figures describe this cutting fan-out work by roughly 90% for larg
 
 **Relay** processes extend Manifold's per-node worker idea with an additional layer, with each relay handling up to 15,000 sessions.
 
-This shifts the guild's effective concurrency ceiling from the tens-of-thousands Manifold-era limit into the millions [5]. A secondary optimization avoided replicating a guild's entire member list (which can itself be millions of entries) to every relay, keeping only recently-changed member data in each relay's process heap while the full list lives once in shared ETS storage [5].
+This shifts the guild's effective concurrency ceiling from the tens-of-thousands Manifold-era limit into the millions [5]. A secondary optimization stopped copying a guild's entire member list (tens of millions of entries) into every relay, keeping only the tiny fraction of members each relay actually needed; separately, member data was put in shared ETS so worker processes could run all-member operations (like an @everyone ping) off the guild process [5].
 
 The team also built dedicated instrumentation for this work: stack-trace sampling via `Process.info/2`, event-loop timing broken down by message type, and custom memory-sampling on top of `erts_debug.size`. Generic profiling tools simply didn't have visibility into per-process costs at this scale [5].
 
@@ -505,7 +614,7 @@ Discord's SFU, written in C++, also does moderation-relevant work at the relay l
 
 Several deliberate deviations from "textbook" WebRTC show up here specifically because of scale. Full ICE negotiation is skipped, since a server-relay architecture removes the need for the peer-to-peer path discovery ICE exists for.
 
-The SDP-equivalent handshake is trimmed to under ~1,200 bytes instead of a typical ~10KB, and DTLS/SRTP's standard negotiation is replaced with a faster Salsa20-based encryption handshake [6].
+The join handshake is trimmed to under ~1,200 bytes round trip, and native clients replace DTLS/SRTP with faster Salsa20 encryption (browsers still use DTLS/SRTP) [6].
 
 In large channels, silent participants' audio packets are simply omitted rather than sent as empty payloads, saving both bandwidth and CPU that would otherwise go toward encoding and forwarding silence [6].
 
@@ -515,7 +624,7 @@ In large channels, silent participants' audio packets are simply omitted rather 
 
 The original 2017 design sharded messages across two Elasticsearch clusters, fed by a Redis-backed queue [7].
 
-That queue would silently drop messages under CPU pressure (for instance, during backups), meaning search results could go quietly out of date with no visible error [7].
+That queue would drop messages once its CPU maxed out (typically after an Elasticsearch node failure backed the queue up), meaning search results could go quietly out of date with no visible error [7].
 
 As the clusters grew past 200 nodes, coordination overhead made routine operations — software upgrades, rolling restarts — increasingly painful, and the very largest guilds began hitting Lucene's hard per-index document ceiling, causing indexing to fail outright for exactly the servers generating the most messages [7].
 
@@ -531,10 +640,10 @@ The result: median query latency fell from about 500ms to under 100ms, and p99 f
 
 **A single node fails inside a 100-node legacy Elasticsearch cluster.**
 - *Trigger:* ordinary hardware/node failure, nothing exotic.
-- *What happens:* under the pre-2025 architecture, a single node failure could cause roughly 40% of bulk indexing operations across the whole 100-node cluster to fail.
+- *What happens:* under the pre-2025 architecture, Discord's own worked example (100 nodes, 50-message batches) shows a single node failure failing roughly 40% of bulk indexing operations.
 - *Root cause:* this happened because of how tightly coordinated large-cluster bulk operations were [7].
 - *Why the fix is architectural, not operational:* the 2025 redesign's answer wasn't "make single-node failures less likely," it was "shrink the blast radius of any one cluster."
-- *Result:* 40 independent ~200-million-message clusters mean a bad node only affects its own cell, not a shared 100+ node cluster [7].
+- *Result:* 40 smaller independent clusters mean a bad node only affects its own cell, not a shared 100+ node cluster [7].
 
 **MongoDB's working set stops fitting in RAM (November 2015).**
 - *Trigger:* ordinary, linear growth — no single bad event, just crossing 100 million stored messages [2].
@@ -553,7 +662,7 @@ The result: median query latency fell from about 500ms to under 100ms, and p99 f
 - *Proof it worked:* Discord's own account describes this design proving itself when a presence service crashed and session services stayed healthy because the blast radius had already been bounded [1].
 
 **A search queue silently drops messages under load (pre-2025).**
-- *Trigger:* CPU pressure on the Redis-backed indexing queue, such as during a backup job.
+- *Trigger:* the Redis-backed indexing queue backing up (often after an Elasticsearch node failure) until Redis CPU maxed out.
 - *What happens:* the queue would silently drop messages rather than backing up visibly, so search results could go quietly stale with no alert firing [7].
 - *Why silent data loss is worse than a visible outage:* an outage gets noticed and fixed; silently missing search results erode trust in the feature without anyone necessarily realizing why, until users start reporting "I know I said that, why can't I find it."
 - *The fix:* replacing the queue technology itself (Redis → Google Cloud PubSub) rather than trying to make the existing queue drop less often — PubSub's guaranteed-delivery model tolerates a large backlog instead of shedding messages under pressure [7].
@@ -566,7 +675,7 @@ The result: median query latency fell from about 500ms to under 100ms, and p99 f
 
 - *What happened, step two:* the Gateway service in that zone then hit memory exhaustion.
 
-- *What happened, step three:* "voice syncer" processes — responsible for routing calls to the right voice server — began backing up, with mailbox queues growing toward roughly a million pending messages.
+- *What happened, step three:* "voice syncer" processes — responsible for routing calls to the right voice server — began backing up, with supervisor mailbox queues growing large (postmortem testing measured ~1ms extra spawn time at a ~100k-message mailbox, and modeled a 1M queue as unrecoverable).
 
 - *What happened, step four:* a connection-pooling bottleneck (a supervisor process doing an expensive "selective receive" scan through its own mailbox on every new connection) meant the system couldn't drain the backlog fast enough to recover on its own [8].
 
@@ -605,8 +714,8 @@ A pattern runs through most of these rows: almost every one of them is a version
 - **A cache/lookup that's read far more than it's written deserves its own optimized path.** FastGlobal — exploiting a read-only shared heap for rarely-changing data — is a specific instance of a general and reusable idea: identify your hottest, least-volatile reads and give them a dramatically cheaper path than your general-purpose lookup.
 - **Backpressure (Semaphore) is what turns cascading failure into contained failure.** Naming *why* a bounded-concurrency limiter stops a crash from spreading (it rejects excess load instead of queueing it indefinitely into a resource that's already struggling) is a stronger answer than just saying "add rate limiting."
 - **Garbage-collected languages have a specific, nameable cost model** (periodic stop-the-world pauses whose scan cost scales with live heap size), and knowing when that cost model is unacceptable — a service checked hundreds of thousands of times a second, like Read States — is a concrete way to justify reaching for Rust/C++ instead of just asserting "Rust is faster."
-- **Storage migrations at scale are a systems-design problem in their own right.** The Cassandra→ScyllaDB migration (verify a sample of live traffic against both databases, build a custom high-throughput migrator, execute a single hard cutover rather than a long dual-write period) is a reusable playbook, not a Discord-specific trick.
-- **Every "we solved scaling" claim has an expiration date.** Discord solved guild fan-out in 2017 (Manifold) and then had to solve a *harder version of the same problem* in 2022 (Maxjourney) at two more orders of magnitude — a good reminder, in an interview, to state the scale a proposed design is good for rather than implying it's good forever.
+- **Storage migrations at scale are a systems-design problem in their own right.** The Cassandra→ScyllaDB migration (verify a sample of live traffic against both databases, build a custom high-throughput migrator, dual-write new data while a custom high-throughput migrator backfills history, then validate and switch) is a reusable playbook, not a Discord-specific trick.
+- **Every "we solved scaling" claim has an expiration date.** Discord solved guild fan-out in 2017 (Manifold) and then had to solve a *harder version of the same problem* by 2023 (Maxjourney) at two more orders of magnitude — a good reminder, in an interview, to state the scale a proposed design is good for rather than implying it's good forever.
 - **Voice/video and text messaging are different enough problems that they deserve entirely separate infrastructure** — different language (C++ vs. Elixir), different protocol assumptions (UDP/SRTP vs. WebSocket/TCP), and different failure isolation, even inside the same product.
 
 **A few follow-up questions worth rehearsing an answer to, if this page came up in an interview:**
@@ -617,20 +726,22 @@ A pattern runs through most of these rows: almost every one of them is a version
 
 ## Glossary
 
+New to these terms? The [concepts](../concepts/README.md) folder explains the core ideas in depth.
+
 - **Elixir**: a programming language that runs on the Erlang VM (BEAM), giving it the same lightweight-process, fault-isolated concurrency model as Erlang, with more modern syntax and tooling.
 - **BEAM / Erlang VM**: the runtime that schedules millions of small, isolated "processes" (not OS processes) across a handful of OS threads — see the WhatsApp page for more depth on this same runtime.
 - **GenServer**: a standard Elixir/Erlang pattern for a process that holds some state and responds to messages one at a time, used here as the building block for both session and guild processes.
 - **Guild**: Discord's internal name for what users see as a "server" — a community with channels, members, and roles.
-- **Gateway**: Discord's WebSocket-based real-time API, as distinct from its REST API.
-- **Fan-out**: delivering one event (like a new message) to many recipients.
+- **[Gateway](../concepts/persistent-connections.md)**: Discord's WebSocket-based real-time API, as distinct from its REST API.
+- **[Fan-out](../concepts/fan-out.md)**: delivering one event (like a new message) to many recipients.
 - **Manifold**: an open-sourced Discord library that groups fan-out recipients by destination node and routes delivery through per-node relay workers instead of sending to every recipient individually.
 - **FastGlobal**: an open-sourced Discord library that exploits the BEAM's read-only shared heap to make reads of rarely-changing shared data extremely cheap.
 - **Semaphore**: an open-sourced Discord library implementing atomic-counter backpressure, so an overloaded resource rejects excess concurrent requests instead of queueing them indefinitely.
 - **ETS (Erlang Term Storage)**: an in-memory key-value store built into the BEAM, used for fast shared access to data across processes on the same node.
 - **Passive / active session**: Maxjourney's distinction between a connection actively viewing a server (gets the full event stream) and one that isn't (gets a stripped-down update stream), used to cut fan-out cost in huge guilds.
 - **Snowflake ID**: a 64-bit identifier that's both unique and roughly sortable by creation time, so you can tell approximately when something was created just from its ID.
-- **Bucketing (in a database)**: grouping rows that would otherwise share one very large partition into several smaller partitions (here, by time range), to avoid overloading a single node.
-- **Hot partition**: a portion of a partitioned database receiving disproportionate traffic, causing the one node holding it to become a bottleneck while others sit comparatively idle.
+- **[Bucketing (in a database)](../concepts/sharding.md)**: grouping rows that would otherwise share one very large partition into several smaller partitions (here, by time range), to avoid overloading a single node.
+- **[Hot partition](../concepts/sharding.md)**: a portion of a partitioned database receiving disproportionate traffic, causing the one node holding it to become a bottleneck while others sit comparatively idle.
 - **Cassandra**: an open-source, horizontally-scalable database (written in Java) that Discord used for message storage from 2016–2022.
 - **ScyllaDB**: a Cassandra-compatible database written in C++, using a shard-per-core design, that Discord migrated to in 2022.
 - **Shard-per-core**: an architecture where each CPU core owns and processes its own slice of data independently, reducing cross-core coordination overhead.
@@ -647,13 +758,13 @@ A pattern runs through most of these rows: almost every one of them is a version
 - **Lucene**: the underlying search-indexing library inside Elasticsearch, which has a hard ceiling of roughly 2 billion documents per index.
 - **Index (in search)**: a self-contained collection of searchable documents inside Elasticsearch; a deployment can run many indices across many clusters.
 - **Kubernetes**: a system for automatically deploying, scaling, and managing containerized services across many machines.
-- **PubSub (Google Cloud)**: a managed message-queueing service guaranteeing delivery even under backlog, used to replace a Redis-based queue that could silently drop messages under load.
+- **[PubSub (Google Cloud)](../concepts/message-queues-and-logs.md)**: a managed message-queueing service guaranteeing delivery even under backlog, used to replace a Redis-based queue that could silently drop messages under load.
 - **etcd**: a distributed key-value store commonly used for service discovery — here, to look up which voice server a user should connect to.
-- **Consistent hashing**: a way of mapping keys (like channel IDs) to nodes such that adding or removing a node only reshuffles a small fraction of the mapping, instead of nearly all of it.
-- **Backpressure**: a system's ability to push back on incoming work when it's overloaded (e.g., rejecting or delaying new requests) instead of silently accepting more than it can handle until it fails.
+- **[Consistent hashing](../concepts/consistent-hashing.md)**: a way of mapping keys (like channel IDs) to nodes such that adding or removing a node only reshuffles a small fraction of the mapping, instead of nearly all of it.
+- **[Backpressure](../concepts/rate-limiting.md)**: a system's ability to push back on incoming work when it's overloaded (e.g., rejecting or delaying new requests) instead of silently accepting more than it can handle until it fails.
 - **Linearizability (in messaging)**: the guarantee that messages from the same sender arrive at each recipient in the same order they were sent, even when the delivery path involves multiple intermediate hops.
 - **Admission webhook (Kubernetes)**: a check Kubernetes runs before allowing an action (like terminating a pod), which can block or modify that action — used by Discord to require graceful draining before a pod is killed.
-- **Mailbox (in Erlang/Elixir)**: the inbox of pending messages every process has; if messages arrive faster than a process can handle them, its mailbox grows without bound and becomes a bottleneck in its own right.
+- **[Mailbox (in Erlang/Elixir)](../concepts/message-queues-and-logs.md)**: the inbox of pending messages every process has; if messages arrive faster than a process can handle them, its mailbox grows without bound and becomes a bottleneck in its own right.
 
 ## Sources
 
@@ -662,7 +773,7 @@ A pattern runs through most of these rows: almost every one of them is a version
 3. [How Discord Stores Trillions of Messages](https://discord.com/blog/how-discord-stores-trillions-of-messages) — Discord Engineering Blog (Cassandra to ScyllaDB migration).
 4. [Why Discord is Switching from Go to Rust](https://discord.com/blog/why-discord-is-switching-from-go-to-rust) — Discord Engineering Blog, February 2020.
 5. [Maxjourney: Pushing Discord's Limits with a Million+ Online Users in a Single Server](https://discord.com/blog/maxjourney-pushing-discords-limits-with-a-million-plus-online-users-in-a-single-server) — Discord Engineering Blog, October 2023.
-6. [How Discord Handles Two and a Half Million Concurrent Voice Users using WebRTC](https://discord.com/blog/how-discord-handles-two-and-half-million-concurrent-voice-users-using-webrtc) — Discord Engineering Blog, 2021.
+6. [How Discord Handles Two and a Half Million Concurrent Voice Users using WebRTC](https://discord.com/blog/how-discord-handles-two-and-half-million-concurrent-voice-users-using-webrtc) — Discord Engineering Blog, September 2018.
 7. [How Discord Indexes Trillions of Messages](https://discord.com/blog/how-discord-indexes-trillions-of-messages) — Discord Engineering Blog, April 2025.
 8. [Behind the Scenes of the 3/25/26 Voice Outage](https://discord.com/blog/behind-the-scenes-of-the-3-25-26-voice-outage) — Discord Engineering Blog, 2026.
 9. [Real time communication at scale with Elixir at Discord](https://elixir-lang.org/blog/2020/10/08/real-time-communication-at-scale-with-elixir-at-discord/) — elixir-lang.org, October 2020, authored by Discord engineering. *(third-party-hosted, Discord-authored)*

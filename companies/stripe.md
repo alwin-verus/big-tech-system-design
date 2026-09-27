@@ -18,6 +18,7 @@
 - [Before you read: design it yourself](#before-you-read-design-it-yourself)
 - [The problem](#the-problem)
 - [Scale](#scale)
+- [Back-of-the-envelope math](#back-of-the-envelope-math)
 - [Requirements](#requirements)
 - [How it evolved](#how-it-evolved)
 - [High-level design](#high-level-design)
@@ -117,7 +118,7 @@ spend; silently drop one and the merchant ships a shoe for free. Both requests c
 customer and a chargeback.
 
 Scale that moment up: this exact race happens constantly, across 135+ currencies and 185+ countries
-[9](#sources), while Stripe also has to prove — not just "probably," but provably — that every one
+[8](#sources), while Stripe also has to prove — not just "probably," but provably — that every one
 of the trillion-plus dollars that moved through its systems landed exactly where it should have,
 tell every merchant asynchronously the instant something changes, and do all of this without one
 merchant's traffic spike taking down the API for everyone else.
@@ -166,6 +167,114 @@ process that many), it's 5 billion individual bookkeeping events — because a s
 out into a charge event, a fee event, a payout event, a currency-conversion event, and more, each of
 which has to balance on its own.
 
+## Back-of-the-envelope math
+
+Back-of-the-envelope math is the rough, order-of-magnitude arithmetic engineers do on a whiteboard to size a system before building it — not a precise forecast. Inputs marked with a [n] reference are pulled straight from this page's Scale table; everything else is a labeled `Assumption:` used purely for illustration.
+
+### Payments per second, average and peak
+
+**Question:** How many payments/sec does Stripe's platform actually process, on average and at peak?
+
+**Inputs:**
+- Total payment volume processed: ~$1.4 trillion (2024) [10](#sources)
+- Assumption: average transaction size ≈ $50
+- Assumption: peak traffic ≈ 2-3x average (use 3x)
+
+**Math:**
+```text
+transactions_per_year = $1,400,000,000,000 / $50
+                       = 28,000,000,000 transactions/year
+
+seconds_per_year       = 365 * 86,400
+                       = 31,536,000 sec
+
+avg_tx_per_sec         = 28,000,000,000 / 31,536,000
+                       ≈ 888 transactions/sec
+
+peak (3x)              = 888 * 3
+                       ≈ 2,664 transactions/sec
+```
+
+**Answer:** ~890 payments/sec average, ~2,700/sec at peak (rounded).
+
+**What it tells you:** compare that peak to the global rate limit of 100 requests/sec per account [6](#sources) — a single very large merchant, on its own, could exceed its own per-account cap at that rate. The platform-wide total only works because volume is spread across hundreds of thousands of separate accounts, not because any one account is expected to carry it. See [Rate limiting](#rate-limiting).
+
+### Ledger fan-out upper bound vs. DocDB headroom
+
+**Question:** Given 5B ledger events/day, what's the maximum number of underlying payments that could represent — and how much DocDB headroom does that leave?
+
+**Inputs:**
+- Ledger event volume: 5 billion events/day [8](#sources)
+- Assumption: at least ~4 ledger events per payment (the page's own examples: a charge event, a fee event, a payout event, a currency-conversion event)
+- DocDB query throughput: 5 million+ queries/sec [9](#sources), [10](#sources)
+
+**Math:**
+```text
+max_payments_per_day = 5,000,000,000 / 4
+                      = 1,250,000,000 payments/day
+
+max_payments_per_sec = 1,250,000,000 / 86,400
+                      ≈ 14,468 payments/sec
+
+headroom_multiple    = 5,000,000 / 14,468
+                      ≈ 345.6x
+```
+
+**Answer:** at most ~14,500 payments/sec company-wide (an upper bound — real fan-out is likely higher than the assumed minimum of 4, so the true rate is lower).
+
+**What it tells you:** even at that upper bound, DocDB's 5M+ q/s gives well over 300x headroom over ledger-driven writes alone — meaning DocDB's query volume is dominated by product/API reads, not the ledger, as covered in [DocDB / MongoDB storage layer](#docdb--mongodb-storage-layer).
+
+### Average queries/sec per DocDB shard
+
+**Question:** How much traffic does a single DocDB shard carry, on average?
+
+**Inputs:**
+- DocDB query throughput: 5 million+ queries/sec [9](#sources), [10](#sources)
+- DocDB footprint: 2,000+ database shards [9](#sources), [10](#sources)
+- Assumption: load is evenly distributed across shards (real traffic isn't — see below)
+
+**Math:**
+```text
+avg_qps_per_shard = 5,000,000 / 2,000
+                   = 2,500 queries/sec/shard
+```
+
+**Answer:** ~2,500 queries/sec per shard, on average.
+
+**What it tells you:** real traffic is never this even — some shards run far hotter than 2,500/s while others sit idle — which is exactly the "hot shard" problem the zero-downtime migration tooling in [DocDB / MongoDB storage layer](#docdb--mongodb-storage-layer) exists to rebalance away from.
+
+### Idempotency key working set
+
+**Question:** Roughly how many idempotency keys does Stripe need to keep indexed and looked-up at any given moment?
+
+**Inputs:**
+- Idempotency key retention: keys removable after ≥24 hours [2](#sources), [3](#sources)
+- Assumption: request rate needing a stored key ≈ the ~888/sec average payments rate from the estimate above
+
+**Math:**
+```text
+retention_window_sec = 24 * 3,600
+                      = 86,400 sec
+
+keys_in_flight        = 888 * 86,400
+                      ≈ 76,723,200
+                      ≈ 76.7M keys
+```
+
+**Answer:** ~77M idempotency keys resident at any moment (order of magnitude).
+
+**What it tells you:** tens of millions of hot keys, each needing a sub-millisecond existence check on every mutating request, is why idempotency keys live in the same fast, sharded datastore (DocDB) as everything else rather than a single-node table. See [Idempotency keys](#idempotency-keys).
+
+### Rules of thumb used
+
+| Rule of thumb | Value |
+|---|---|
+| 1 day | ~86,400 s ≈ 10^5 s |
+| 1 year | ~31,536,000 s ≈ 3*10^7 s |
+| Peak vs. average traffic | ~2-3x, for a typical consumer/merchant platform |
+
+These are general estimation conventions, not Stripe-specific facts.
+
 ## Requirements
 
 **Functional:**
@@ -210,7 +319,7 @@ clean example of that arc:
 |---|---|---|---|---|
 | 2011 | **Tokens + Charges API.** Create a `Token` for card details, then a `Charge` against it — one synchronous call, one response. | Assumed every payment method behaves like a credit card: instant, synchronous, single-step. Didn't fit payment methods that settle asynchronously (bank debits taking days) or need extra steps mid-flow. | — | [14](#sources) |
 | 2015-2017 | **Sources API.** An attempt to unify many payment methods (cards, bank redirects, wallets) under one abstraction. | Async, browser-redirect methods like iDEAL exposed the gap directly: "if the browser loses connectivity before communicating back to the merchant's server, the server never creates a Charge." Merchants had to run two parallel integration styles — synchronous for cards, webhook-driven for everything else — and track two different IDs. | PaymentIntents | [14](#sources) |
-| 2017-2019 | **PaymentIntents + PaymentMethods + SetupIntents.** A payment becomes an explicit state machine (`requires_payment_method` → ... → `succeeded`) decoupled from the specific payment method used. | Driven partly by *Strong Customer Authentication (SCA)* regulation in Europe, which forced multi-step authentication (3D Secure) into the middle of a payment — something the old Charges model had no place for. | Charges API (still exists, but as an implementation detail *behind* PaymentIntents, kept for backward compatibility) | [11](#sources), [14](#sources) |
+| 2017-2019 | **PaymentIntents + PaymentMethods + SetupIntents.** A payment becomes an explicit state machine (`requires_payment_method` → ... → `succeeded`) decoupled from the specific payment method used. | Needed to support multi-step flows such as *Strong Customer Authentication (SCA)* / 3D Secure, which put an authentication step into the middle of a payment — something the old Charges model had no place for (that SCA regulation *drove* the redesign is unverified). | Charges API (still exists, but as an implementation detail *behind* PaymentIntents, kept for backward compatibility) | [11](#sources), [14](#sources) |
 | 2011 onward | **Raw MongoDB Community**, chosen for developer velocity over a relational database at a time MongoDB Atlas didn't exist yet. | As Stripe grew into hundreds of terabytes and then petabytes across thousands of product collections, a bare MongoDB deployment had no answer for safe, zero-downtime resharding, and nothing stopped an application from issuing an expensive, unbounded query straight at a shard. | **DocDB**: an in-house proxy + routing-metadata layer in front of MongoDB, enforcing query shape and access control | [9](#sources), [10](#sources) |
 | Later | **DocDB at fixed shard count.** | Traffic isn't static — some shards get hot, others sit idle; a fixed shard layout means either paying for permanent headroom everywhere or eventually hitting a wall on a hot shard. | **Data Movement Platform**: split/merge shards and bin-pack underutilized ones live, with millisecond-to-2-second traffic cutovers | [9](#sources), [10](#sources) |
 | Ongoing | **Ad hoc reconciliation** between the many internal systems that record money movement (billing, payouts, disputes, connect), each with its own pace and format. | No forcing function meant no guarantee two systems agreed about the same dollar — and no fast way to *prove* they did or find it when they didn't. | **Ledger**: one immutable, append-only, double-entry log that every producer system publishes into, plus a data-quality platform on top of it | [8](#sources) |
@@ -256,8 +365,8 @@ Walking through a typical request:
    control back to the client — the request that started this whole flow isn't necessarily the one
    that finishes it.
 4. To actually move money, it calls out to **card networks / banks**. Every one of Stripe's own
-   outbound calls is itself wrapped with its own idempotency key, so a retry on Stripe's side can't
-   double-charge the card network either [15](#sources) — the same pattern the merchant relies on
+   outbound calls is presumably wrapped with its own idempotency key, so a retry on Stripe's side can't
+   double-charge the card network either *(unverified — no cited source documents this)* — the same pattern the merchant relies on
    for step 1 is used recursively, one layer down, by Stripe against the networks it depends on.
 5. Once money moves, the service writes an immutable, balanced entry into **Ledger**, Stripe's
    internal system of record for money movement, built on double-entry bookkeeping [8](#sources).
@@ -732,7 +841,7 @@ Stripe staff engineer Jimmy Morzaria [9](#sources), [10](#sources):
   with any request caught mid-switch simply retried against the now-current routing [10](#sources).
 - The same platform is used for more than emergency resharding — it also does **bin packing**,
   consolidating many underutilized shards down onto fewer machines when traffic is low, migrating
-  roughly 1.5 petabytes this way in 2023 *(third-party figure)* [15](#sources).
+  roughly 1.5 petabytes this way in 2023 [9](#sources).
 
 > **Why this matters:** the interesting engineering here isn't "we picked MongoDB" — it's that
 > Stripe treated "move live data between machines with no downtime" as a first-class, reusable
@@ -1064,7 +1173,9 @@ at all [6](#sources).
 
 ## Glossary
 
-- **Idempotency key**: a unique value a client attaches to a request so that sending the same
+New to these terms? The [concepts](../concepts/README.md) folder explains the core ideas in depth.
+
+- **[Idempotency key](../concepts/idempotency.md)**: a unique value a client attaches to a request so that sending the same
   request twice (say, because of a retry) is guaranteed to have the same effect as sending it once.
 - **Idempotent-Replayed header**: a response header Stripe sets to `true` when it's giving you back
   a cached result from an earlier request with the same idempotency key, instead of doing the work
@@ -1074,7 +1185,7 @@ at all [6](#sources).
   always balance to zero and money can't silently appear or vanish.
 - **Balance transaction**: Stripe's public object representing one line item of money movement (a
   charge, a fee, a payout) and its effect on your available balance.
-- **Immutable log**: a record of events that can only be appended to, never edited or deleted — you
+- **[Immutable log](../concepts/message-queues-and-logs.md)**: a record of events that can only be appended to, never edited or deleted — you
   fix mistakes by adding a new correcting entry, not by changing history.
 - **State machine**: a model where something (like a payment) can only be in one of a fixed set of
   states at a time, and moves between them via defined transitions (e.g. `requires_payment_method` →
@@ -1082,18 +1193,18 @@ at all [6](#sources).
 - **3D Secure (3DS) / Strong Customer Authentication (SCA)**: an extra authentication step (like a
   bank's one-time code) inserted into a card payment, required by European regulation, that a
   payment API has to be able to pause for mid-transaction.
-- **Token bucket**: a rate-limiting algorithm where a bucket holds "tokens" that refill at a steady
+- **[Token bucket](../concepts/rate-limiting.md)**: a rate-limiting algorithm where a bucket holds "tokens" that refill at a steady
   rate; each request spends one token, and an empty bucket means the request gets rejected.
 - **Load shedding**: deliberately rejecting some lower-priority requests so the system has enough
   capacity left to serve the requests that matter most.
-- **Fail open vs. fail closed**: what a safety system does when it itself breaks — "fail open" lets
+- **[Fail open vs. fail closed](../concepts/rate-limiting.md)**: what a safety system does when it itself breaks — "fail open" lets
   traffic through anyway (favoring availability), "fail closed" blocks it (favoring safety); a
   broken rate limiter that fails closed would take down the whole API by itself.
-- **Sharding**: splitting one big database into many smaller pieces (shards) by some key (like
+- **[Sharding](../concepts/sharding.md)**: splitting one big database into many smaller pieces (shards) by some key (like
   account ID) so no single machine has to hold or serve all the data.
 - **Document database**: a database that stores data as flexible, JSON-like documents rather than
   fixed rows/columns, so different records in the same collection can have different fields.
-- **Replica set**: a group of database servers holding copies of the same data — one primary that
+- **[Replica set](../concepts/replication.md)**: a group of database servers holding copies of the same data — one primary that
   takes writes, several secondaries that follow along — so a primary failure can be recovered from
   automatically.
 - **Oplog / write-ahead log**: an ordered log of every write a database made, originally used to let

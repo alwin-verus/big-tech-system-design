@@ -71,7 +71,7 @@ None of these companies sharded early for fun. Each hit a specific wall.
 | Airbnb | ~2015: a shared database made every team's reliability depend on every other team's queries | [Airbnb: SOA migration](../companies/airbnb.md#soa-migration-from-the-rails-monolith) |
 | Stripe | Petabytes across thousands of collections, with no zero-downtime resharding | [Stripe: DocDB](../companies/stripe.md#docdb--mongodb-storage-layer) |
 | Dropbox | Hand-managed MySQL shards; later, Edgestore could only grow by doubling the whole fleet | [Dropbox: Edgestore](../companies/dropbox.md#edgestore) |
-| Twitter/X | Cassandra plus bolt-on tools for strong consistency, two operating models | [Twitter/X: Manhattan](../companies/twitter-x.md#manhattan-one-distributed-database-many-tenants-two-consistency-models) |
+| Twitter/X | Open-source databases with a cluster built out per feature, too slow for real-time needs | [Twitter/X: Manhattan](../companies/twitter-x.md#manhattan-one-distributed-database-many-tenants-two-consistency-models) |
 
 A pattern worth naming: Dropbox and Discord each hit a **second** wall after their first fix.
 Edgestore scaled by splitting the entire fleet, doubling physical cost, the same shape as the MySQL
@@ -263,7 +263,7 @@ replaying the same oplog entry twice has the same effect as once, which is what 
 migration safe.
 
 Real payoffs: in March 2020, pandemic remote work pushed Slack's query rate up 50% in one week, and
-Vitess split the busiest shard live with no customer-visible downtime. Stripe uses the same platform
+Slack split one of its busiest keyspaces horizontally with Vitess's splitting workflows, avoiding downtime for its largest customers. Stripe uses the same platform
 for routine **bin packing** (squeezing many underused shards onto fewer machines), not just
 emergencies.
 
@@ -312,8 +312,8 @@ JVM, and at large scale **garbage-collection pauses** (moments where the runtime
 memory) dominated tail latency.
 
 - Instagram built **Rocksandra**: Cassandra's replication and query layers on top of RocksDB, a C++
-  engine with no garbage collector. P99 reads went from ~60ms to ~20ms, and GC-stalled reads from
-  2.5% to 0.3% (see [Instagram: Cassandra and
+  engine with no garbage collector. P99 reads went from ~60ms to ~20ms, and time lost to GC stalls from
+  2.5% to 0.3% of server runtime (see [Instagram: Cassandra and
   Rocksandra](../companies/instagram.md#cassandra-and-the-rocksandra-storage-engine)).
 - Discord moved to ScyllaDB, a C++ Cassandra-compatible database with a **shard-per-core** design
   (each CPU core owns its own slice of data), which also isolates hot partitions better.
@@ -339,7 +339,7 @@ metadata is small and constantly changing; bytes are huge and written once.
   because they trusted their own operational experience with it. Instagram stayed on Postgres.
   Operational trust was an explicit deciding factor at Uber.
 - **Era.** YouTube built Vitess for itself in 2010 and donated it to the CNCF (a foundation that
-  hosts open-source infrastructure projects) in 2018. Slack adopted it in 2016. Stripe picked
+  hosts open-source infrastructure projects) in 2018. Slack began migrating to it in 2017. Stripe picked
   MongoDB in 2011 when no managed MongoDB service existed yet.
 - **Scale of the biggest tenant.** Slack's key broke because of a few enormous customers. Discord's
   partitions broke because of a few enormous channels. The largest single unit, not the average,

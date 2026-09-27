@@ -85,7 +85,8 @@ idempotency keys](../companies/stripe.md#idempotency-keys)):
   freely.
 - Keys can be pruned after about 24 hours.
 - Stripe does the same thing one level down: its own calls to card networks carry their own
-  idempotency keys, so a retry inside Stripe cannot double-charge either.
+  idempotency keys, so a retry inside Stripe cannot double-charge either (unverified; Stripe has
+  not documented this publicly).
 
 The golden rule this creates for every integrator: **a timeout means "retry with the same key",
 never "retry with a new key"**. (The internal locking details come from a reference implementation
@@ -134,7 +135,7 @@ any payment attempt. If the hold fails because another guest got there first, th
 nobody is charged. The Airbnb page describes the calendar as one row per `(listing_id, night_date)`
 with a status, and a database-enforced rule that at most one `booked` row exists per key. The `held`
 state has a short **TTL** (time to live), so an abandoned checkout tab releases the nights by
-itself. Airbnb has confirmed the calendar is its own partitioned domain; the exact locking and TTL
+itself. Airbnb has not published how the calendar is partitioned; the partitioning, locking and TTL
 mechanics are a labeled reference design (see [Airbnb: availability
 calendar](../companies/airbnb.md#availability-calendar)).
 
@@ -294,8 +295,8 @@ publishes each row change as a Kafka event. Services never call each other just 
 (see [Airbnb: SOA migration](../companies/airbnb.md#soa-migration-from-the-rails-monolith)).
 
 **Uber's** Schemaless has **triggers**: downstream services register to be called asynchronously
-when a cell changes, effectively an event bus inside the datastore. Location pings and trip events
-also stream through Kafka. When Uber moved to Spanner, which has no built-in change capture, it
+when a cell changes, effectively an event bus inside the datastore. Trip data and rider/driver status
+also stream through Kafka (into surge pricing). When Uber moved to Spanner, which has no built-in change capture, it
 built its own component (LATE) to get trigger-like behavior back.
 
 ## Dimension 6: protecting the money path under load

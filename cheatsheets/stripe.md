@@ -25,7 +25,7 @@ flowchart LR
 
 | Metric | Number | Source |
 |---|---|---|
-| Total payment volume processed | ~$1.4 trillion (2024) | [How Stripe's document databases supported 99.999% uptime](https://stripe.dev/blog/how-stripes-document-databases-supported-99.999-uptime-with-zero-downtime-data-migrations) |
+| Total payment volume processed | ~$1.4 trillion (2024) | [Stripe's Docdb: Zero-Downtime Data Movement — QCon SF 2025 (InfoQ)](https://www.infoq.com/presentations/docdb-online-database/) |
 | Core datastore (DocDB) uptime | 99.999% (2023) | [How Stripe's document databases supported 99.999% uptime](https://stripe.dev/blog/how-stripes-document-databases-supported-99.999-uptime-with-zero-downtime-data-migrations) |
 | DocDB query throughput | 5 million+ queries/sec | [How Stripe's document databases supported 99.999% uptime](https://stripe.dev/blog/how-stripes-document-databases-supported-99.999-uptime-with-zero-downtime-data-migrations) |
 | Ledger event volume | 5 billion events/day | [Ledger: Stripe's system for tracking and validating money movement](https://stripe.dev/blog/ledger-stripe-system-for-tracking-and-validating-money-movement) |
@@ -48,7 +48,7 @@ flowchart LR
 1. Clarify scope: accept payment across many methods/currencies/countries, guarantee retries never double-charge, prove money moved, notify merchants asynchronously, protect a shared API fleet.
 2. Require an idempotency key on every mutating request; check the key store before running any business logic, and cache-and-replay the first response.
 3. Model a payment as an explicit state machine, not one boolean, so it can pause mid-flow for an extra step (3D Secure) and resume later.
-4. Wrap every outbound call to an external processor with its own idempotency key too — the same pattern recurses one layer down.
+4. Wrap every outbound call to an external processor with its own idempotency key too — the same pattern recurses one layer down (reference design; unverified for Stripe).
 5. Write every money movement as an immutable, balanced, double-entry ledger entry — never mutate a balance in place.
 6. Put a layered rate limiter in front of business logic: per-account token bucket, then concurrency cap, then fleet-wide and incident-priority shedders.
 7. Notify merchants asynchronously via signed webhooks, at-least-once and unordered, and make merchants acknowledge fast, then process later.

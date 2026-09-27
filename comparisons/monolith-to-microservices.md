@@ -38,7 +38,7 @@ becomes a real question.
 |---|---|---|---|---|---|---|
 | Started as | "Monorail": one Ruby on Rails app, one shared database | One Rails app over MySQL | Node.js (Marketplace) and Python monolith, one Postgres for trips | DVD-by-mail company in its own datacenters, big Oracle database | One Django app, one Postgres, on AWS | A backend already split by feature ownership by 2013 |
 | The measured pain | ~15 hours/week of blocked deploys at ~200 engineers | Ruby's GIL, the "Fail Whale", ~1,444% user growth in a year (third-party) | Postgres near capacity; later 400+ engineers on a stack with no extension model | A 3-day database corruption in Aug 2008 stopped DVD shipping | None forced a split | 2,000+ services and nobody could find owners |
-| What they did | SOA with strict data ownership, Thrift RPC, Kafka events | Moved hottest paths to the JVM first, then the front end (Blender) | Hundreds of services; later rebuilt fulfillment on Spanner | Rewrote as microservices while moving to AWS, 2008 to 2016 | Stayed a monolith, invested in deploy tooling | Built Backstage, a service catalog |
+| What they did | SOA with strict data ownership, Thrift RPC, Kafka events | Moved hottest paths to the JVM first, then front ends (Blender for search) | Hundreds of services; later rebuilt fulfillment on Spanner | Rewrote as microservices while moving to AWS, 2008 to 2016 | Stayed a monolith, invested in deploy tooling | Built Backstage, a service catalog |
 | How long | 2015 to 2018 for the core move | About four years from first Mesos test to full migration | Rewrites in 2015 and 2021 | About 7 years | Not applicable | Backstage first commit Oct 2019, open-sourced Mar 2020 |
 | Headline result | Weekly deploys ~3,000 to ~10,000 | Per-host throughput 200-300 to 10,000-20,000 req/s | Platform for 1M+ concurrent users, 10,000+ cities | Last datacenter shut Jan 2016 | 30-50 deploys a day on one codebase (2016) | ~55% faster engineer onboarding |
 
@@ -74,7 +74,7 @@ timeline
   title When each company changed shape
   2008 : Netflix database corruption, cloud and microservices move begins
   2009 : Twitter starts moving hot paths off Rails to the JVM
-  2011 : Twitter Blender replaces the Rails front end
+  2011 : Twitter Blender replaces the Rails search front end
   2013 : Spotify backend already split by squad ownership
   2014 : Uber leaves single Postgres for Schemaless
   2015 : Airbnb measures 15 hours a week of blocked deploys, SOA begins
@@ -89,7 +89,7 @@ There is no single migration strategy on this page. There are four.
 
 **Hottest path first (Twitter).** Twitter did not rewrite everything. It found the two components
 buckling first, the message queue and tweet storage, and rewrote just those in Scala on the JVM
-while the rest stayed on Rails. Then it rewrote the front end as **Blender**, a Java serving stack.
+while the rest stayed on Rails. Then it replaced Rails front ends with JVM servers, starting with **Blender** for search (2011).
 Only once there were many JVM services did it need **Finagle** (an RPC library, the code that lets
 one service call another over the network) and **Mesos with Aurora** (a cluster scheduler that
 decides which machine runs which service). Each step only became necessary because the previous one
@@ -123,7 +123,7 @@ migration](../companies/spotify.md#the-gcp-migration-leaving-four-data-centers-b
 flowchart TB
   subgraph HP["Hottest path first: Twitter"]
     H1["Rails monolith"] --> H2["Rewrite message queue<br/>and tweet storage on JVM"]
-    H2 --> H3["Rewrite front end<br/>as Blender"]
+    H2 --> H3["Replace Rails front ends<br/>(Blender for search)"]
     H3 --> H4["Add Finagle and<br/>Mesos/Aurora"]
   end
   subgraph DO["By domain with data ownership: Airbnb"]
@@ -207,7 +207,7 @@ Every company that split hit a second-order problem, and most built a new system
 
 - **"Which service do I call?"** Airbnb's client engineers had to know which of hundreds of services
   held each piece of data and stitch results together per screen. Airbnb built **Viaduct**, a
-  federated GraphQL layer: one schema for clients, where each backend team owns a module of it (see
+  central-schema GraphQL layer: one schema for clients, where each backend team owns a module of it (see
   [Airbnb: Viaduct](../companies/airbnb.md#data-mesh-viaduct)).
 - **"Did this reservation get paid?"** Splitting payments into pay-in, payout, ledger, and
   settlement services meant no one service could answer. Airbnb added **Unified Payments Data
@@ -215,7 +215,7 @@ Every company that split hit a second-order problem, and most built a new system
   flow](../companies/airbnb.md#booking--payments-flow)).
 - **"Who owns this?"** Spotify built **Backstage**: every service, website, and pipeline registers
   itself with a small metadata file naming its owner, docs, and APIs, and engineers get one
-  searchable catalog. Onboarding time dropped about 55%. Spotify open-sourced it in 2020 and donated
+  searchable catalog. Onboarding time was cut in half. Spotify open-sourced it in 2020 and donated
   it to the CNCF (see [Spotify:
   Backstage](../companies/spotify.md#backstage-the-service-catalog-built-because-who-owns-this-stopped-having-an-answer)).
 - **"Does it survive failure?"** Netflix built **chaos engineering**: Chaos Monkey randomly kills
@@ -250,7 +250,7 @@ Services need owners, and ownership is an org-chart decision.
   and guilds tends toward duplicated effort, which is part of why Spotify later needed company-wide
   tools like Backstage and a standardized CDN (see [Spotify: squads, tribes, chapters,
   guilds](../companies/spotify.md#squads-tribes-chapters-guilds-organizing-people-to-match-a-decentralized-architecture)).
-- **Airbnb** grew from ~90 to 1,000+ engineers between 2015 and 2018, and the migration was sized to
+- **Airbnb** grew from ~90 to ~1,000 engineers between 2014 and 2018, and the migration was sized to
   that growth, not to traffic.
 - **Netflix** frames the payoff in team terms: the recommendations team can deploy ten times a day
   without waiting on the billing team.

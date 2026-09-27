@@ -127,14 +127,13 @@ hot partition](../companies/twitter-x.md#a-hot-key--hot-partition-a-celebrity-ac
 
 Instagram's 2012 architecture already pushed the heavy part of posting off the request. The upload
 request did two things: save the original bytes and drop a job on **Gearman**, a task queue. About
-200 Python workers consumed that queue, resizing images, cross-posting, and fanning the post out to
+200 Python workers consumed that queue, cross-posting, sending notifications, and fanning the post out to
 followers. Because that work happened to the side, a brand-new account and a popular one both got
 the same fast "your post is live" response (see [Instagram: media storage and
 delivery](../companies/instagram.md#media-storage-and-delivery)).
 
 Write-heavy, high-fan-out data such as the activity feed moved from Redis to **Cassandra** in 2012.
-Redis keeps everything in RAM, which got expensive; Cassandra is disk-backed and was reported to cut
-that cost by roughly 75% (a third-party figure) (see [Instagram: Cassandra and
+Redis keeps everything in RAM; Cassandra is disk-backed and scales horizontally (see [Instagram: Cassandra and
 Rocksandra](../companies/instagram.md#cassandra-and-the-rocksandra-storage-engine)).
 
 The part that changed the most is **reading**. Until 2016 the feed was newest-first. Instagram later

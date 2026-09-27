@@ -9,6 +9,7 @@
 - [Before you read: design it yourself](#before-you-read-design-it-yourself)
 - [The problem](#the-problem)
 - [Scale](#scale)
+- [Back-of-the-envelope math](#back-of-the-envelope-math)
 - [Requirements](#requirements)
 - [How it evolved](#how-it-evolved)
 - [High-level design](#high-level-design)
@@ -108,10 +109,10 @@ By the end of this page you should be able to answer:
 
 | Metric | Number | Source |
 |---|---|---|
-| Video uploaded to YouTube | 500+ hours of video uploaded every minute (2020) | [1](#sources) |
-| Transcoding efficiency gain from custom silicon (Argos VCU) vs. the prior CPU-based system | 20–33x improvement in compute efficiency (stated 2020) | [1](#sources) |
-| Argos VCU deployment | "Thousands" of VCU chips running in Google data centers; each chip has 10 encoder cores, each capable of real-time 2160p60 encoding (2021) | [14](#sources) *(third-party)* |
-| Argos VCU density per production server | 20 VCU accelerators per machine (10 cards, 2 VCUs per card over PCIe Gen3 x16), compared against baselines of dual Intel Xeon Skylake servers and 4x Nvidia T4 GPU servers (2021, Hot Chips talk) | [19](#sources) *(third-party)* |
+| Video uploaded to YouTube | 500+ hours of video uploaded every minute (stated April 2021) | [1](#sources) |
+| Transcoding efficiency gain from custom silicon (Argos VCU) vs. the prior CPU-based system | 20–33x improvement in compute efficiency (stated April 2021) | [1](#sources) |
+| Argos VCU deployment | Deployed in Google data centers (no chip count given); each chip has 10 encoder cores, two chips per board (2021) | [14](#sources) *(third-party)* |
+| Argos VCU density per production server | 20 VCU accelerators per machine (10 cards, 2 VCUs per card over PCIe Gen3 x16), compared against baselines of dual Intel Xeon Skylake servers and Nvidia T4 GPU servers (April 2021, coverage of Google's ACM paper) | [19](#sources) *(third-party)* |
 | YouTube's user base growth after adopting Vitess | Scaled by a factor of more than 50x | [2](#sources) |
 | Early YouTube growth (pre-Vitess, pre-sharding era) | ~30M video views/day (Mar 2006) → ~100M video views/day (Jul 2006) | [15](#sources) *(third-party)* |
 | Later YouTube growth (per the same widely-cited writeup's own update) | Roughly 1B video views/day | [15](#sources) *(third-party)* |
@@ -133,6 +134,102 @@ Likewise, a Google Global Cache footprint of 1,300+ cities means most viewers' e
 
 And "scaled by more than 50x after adopting Vitess" is the difference between a database architecture that runs out of headroom on one bad launch day and one that keeps absorbing growth for over a decade without a rewrite [2].
 
+## Back-of-the-envelope math
+
+This is the rough arithmetic engineers sketch on a whiteboard to size a system before writing any code — good enough to catch a design that's off by orders of magnitude, not meant to be exact. Inputs marked [n] are pulled straight from the [Scale](#scale) table above and match it exactly; everything else is an explicit **Assumption**, never presented as fact.
+
+### 1. Storage needed per day for freshly uploaded footage
+
+**Question:** At 500+ hours of video uploaded every minute [1](#sources), how much raw storage does one day of new uploads need, for one baseline copy?
+
+**Inputs:**
+- Video uploaded: 500+ hours/minute [1](#sources)
+- Assumption: average source bitrate for one stored baseline copy ≈ 8 Mbps (before the dozen-plus transcoded renditions multiply this further)
+
+**Math:**
+```text
+hours/day = 500 hours/min × 60 min/hour × 24 hours/day
+          = 720,000 hours/day
+
+seconds/day = 720,000 hours × 3,600 s/hour
+            = 2,592,000,000 s/day
+
+storage/day = 2,592,000,000 s × 8 Mb/s ÷ 8 (bits→bytes)
+            = 2,592,000,000 s × 1 MB/s
+            = 2,592,000,000 MB
+            = 2,592,000 GB
+            = 2,592 TB  (≈2.6 petabytes)
+```
+
+**Answer:** ~2.6 petabytes/day just for one baseline copy of newly uploaded footage.
+
+**What it tells you:** real storage growth is a multiple of this, since YouTube encodes each video into a dozen-plus resolution/codec combinations rather than one — exactly why [Colossus](#upload-ingestion-and-the-transcode-fan-out) has to scale to exabytes across tens of thousands of machines per cluster [11](#sources), not a conventional filesystem.
+
+### 2. CPU-equivalent machines replaced by one Argos transcoding box
+
+**Question:** Argos VCU chips deliver a 20-33x compute-efficiency gain over the prior CPU-based system [1](#sources), and 20 VCU accelerators pack into one production machine [19](#sources) — how many CPU-based units does one Argos machine's transcoding throughput replace?
+
+**Inputs:**
+- Transcoding efficiency gain: 20-33x (2021) [1](#sources)
+- Argos VCU density: 20 accelerators/machine [19](#sources)
+- Assumption: treating the per-chip efficiency gain as a rough per-accelerator throughput multiplier vs. an equivalent CPU-based transcoding unit (a simplification — the source describes overall compute efficiency, not a literal one-to-one substitution)
+
+**Math:**
+```text
+low end:  20 accelerators × 20x  = 400 CPU-equivalent units replaced by 1 Argos machine
+high end: 20 accelerators × 33x  = 660 CPU-equivalent units replaced by 1 Argos machine
+```
+
+**Answer:** one Argos machine (20 VCU accelerators) does the transcoding work of roughly 400-660 CPU-based units.
+
+**What it tells you:** at 720,000 hours/day of new footage (Estimate 1), even a 20-33x efficiency gain per chip is the difference between a transcoding fleet that fits in a sane number of racks and one that doesn't — the concrete payoff behind [Upload ingestion and the transcode fan-out](#upload-ingestion-and-the-transcode-fan-out).
+
+### 3. Cross-checking two independent growth figures
+
+**Question:** YouTube's user base is said to have grown ">50x" after adopting Vitess [2](#sources); separately, a widely-cited writeup puts video views at ~30M/day (Mar 2006) rising to ~1B/day later [15](#sources) *(third-party)*. Do these two independently-sourced figures roughly agree?
+
+**Inputs:**
+- User base growth after Vitess: >50x [2](#sources)
+- Early growth: ~30,000,000 video views/day (Mar 2006) [15](#sources) *(third-party)*
+- Later growth: ~1,000,000,000 video views/day [15](#sources) *(third-party)*
+
+**Math:**
+```text
+views growth ratio = 1,000,000,000 / 30,000,000
+                    = 33.3x
+```
+
+**Answer:** ~33x growth in the views figures vs. the >50x cited for Vitess's user base — different metrics (views vs. users) and time windows, but the same rough order of magnitude.
+
+**What it tells you:** independent sources describing different metrics still land in the same growth regime — a useful interview habit: check whether a second, independently-sourced number agrees in order of magnitude before designing around the first one. This is exactly the growth [Vitess sharding and query routing](#vitess-sharding-and-query-routing) had to absorb without a rewrite.
+
+### 4. Average Google Global Cache density per country
+
+**Question:** Google Global Cache is present in 1,300+ cities across 200+ countries/territories [12](#sources) — what's the average number of GGC cities per country, and what does an average like that hide?
+
+**Inputs:**
+- GGC footprint: 1,300+ cities, 200+ countries/territories [12](#sources)
+
+**Math:**
+```text
+avg cities/country = 1,300 / 200
+                    = 6.5 cities per country (average)
+```
+
+**Answer:** ~6.5 GGC cities per country on average.
+
+**What it tells you:** an average like this is a floor for reasoning, not a claim about the real distribution — large, high-traffic countries almost certainly host many more than 6.5 locations while many smaller ones host just one or a handful. Placement is demand-driven, not evenly spread; see [CDN and edge delivery](#cdn-and-edge-delivery-google-global-cache-and-peering).
+
+**Rules of thumb used:**
+
+| Convention | Value used here |
+|---|---|
+| Time unit ladder | 1 day = 24 h = 1,440 min; 1 hour = 3,600 s |
+| Bitrate/storage conversion | 8 megabits (Mb) = 1 megabyte (MB); storage ladder MB→GB→TB→PB each ÷1,000 (decimal) |
+| "X+" scale figures | treated as ≈X for arithmetic (e.g. "500+ hours/minute" → 500) |
+| Order-of-magnitude cross-checks | two independently-sourced numbers on related-but-different metrics count as "consistent" if they land within roughly the same power of ten |
+| Peak vs. average | general convention: peak ≈ 2-3x daily average for systems with daily/weekly demand cycles (not directly needed above, since the cited figures were already rates or ratios) |
+
 ## Requirements
 
 **Functional:**
@@ -147,7 +244,7 @@ And "scaled by more than 50x after adopting Vitess" is the difference between a 
 - **Write scalability for metadata** — view counts, likes, and comments update continuously across billions of videos. *Why it matters:* a single MySQL primary's write throughput hit a ceiling as YouTube's traffic grew in the mid-2000s, which is the entire reason Vitess exists [2][15].
 - **Low latency at extreme, unpredictable fan-out** — a video can go from zero to millions of requests within minutes if it goes viral. *Why it matters:* without caching close to the viewer, a spike like that would hit origin storage as a "thundering herd" and take the service down for everyone, not just that video's viewers.
 - **Elastic transcoding throughput** — upload volume swings with time of day, region, and events, and can spike hard. *Why it matters:* transcoding is CPU/ASIC-heavy and slow per unit of work; if the worker fleet can't flex, uploaded videos sit stuck in "processing" for hours, which creators notice immediately.
-- **Tunable consistency** — some data (view counts) can be briefly stale; other data (who owns a video, whether it's still public) cannot. *Why it matters:* YouTube explicitly trades strict consistency for availability on reads that tolerate staleness, via Vitess's replica reads, while keeping ownership/write paths strict [8].
+- **Tunable consistency** — some data (view counts) can be briefly stale; other data (who owns a video, whether it's still public) cannot. *Why it matters:* YouTube explicitly trades strict consistency for availability on reads that tolerate staleness, via Vitess's replica reads, while keeping ownership/write paths strict [8][18].
 - **Durability of raw uploads** — the source file a creator uploaded must never be lost, even if every downstream transcoding step fails. *Why it matters:* re-uploading a large video is the single worst experience a creator can have; writing durably to Colossus before any processing starts is what makes every later retry cheap and safe [11].
 
 ## How it evolved
@@ -160,11 +257,11 @@ YouTube did not start with any of this. It started as a small Python/MySQL site 
 | 2006 (30M → 100M views/day) | MySQL primary with read replicas (leader-follower replication) [15] | **Replication lag**: the primary was multi-threaded on powerful hardware; replicas applied changes single-threaded on lesser hardware, and cache misses forced disk I/O that slowed replay further [15] | Manual database partitioning |
 | 2006–2009 | Databases partitioned/sharded by user ID at the application layer; thumbnails moved onto Google's Bigtable after the 2006 acquisition [15] | Sharding logic was hand-rolled and scattered across application code; resharding was manual and risky; every new feature had to re-learn "where does this row live" | Vitess |
 | 2010 | YouTube builds Vitess: a proxy layer (`vtgate`/`vttablet`) that sits between the app and MySQL and makes sharding invisible to application code [2] | — | — |
-| 2011–2015 | Vitess becomes a core, load-bearing part of YouTube's MySQL infrastructure, eventually running tens of thousands of MySQL nodes [2][9][16] | Transcoding on general-purpose CPUs became too slow/expensive as demand grew for 1080p and 4K, which need more efficient codecs like VP9 [1] | Google starts designing a custom transcoding ASIC (project starts 2015) [1] |
+| 2011–2015 | Vitess becomes a core, load-bearing part of YouTube's MySQL infrastructure, with Vitess described as scaling to tens of thousands of MySQL nodes [7] | Transcoding on general-purpose CPUs became too slow/expensive as demand grew for 1080p and 4K, which need more efficient codecs like VP9 [1] | Google starts designing a custom transcoding ASIC (project starts 2015) [1] |
 | Mid-2010s | H.264-only encoding gives way to VP9 as the more efficient default codec for adaptive streaming [1] | VP9 needs roughly 5x more compute to encode than H.264, which pushed harder on the same CPU-cost problem the VCU project was already trying to solve [1] | AV1 planned as the next-generation codec, layered on top of newer VCU chip generations [1][14] |
 | 2018–2019 | Vitess donated to the Cloud Native Computing Foundation; accepted as an incubating project Feb 2018, graduated Nov 2019 [2] | — | Wider industry adoption outside Google (Slack, Square/Block, JD.com, PlanetScale) |
 | ~2020–2021 | Argos VCU chips roll out across Google data centers for YouTube transcoding, claiming 20–33x compute-efficiency gains over the prior CPU-based pipeline [1][14] | — | Continued iteration toward AV1-capable chip generations [14] |
-| Today (2026) | Vitess supports online, VReplication-based resharding with only seconds of read-only downtime, plus automated failover via VTOrc/EmergencyReparentShard, hardened as recently as this year [4][5][6] | — | — |
+| Today (2026) | Vitess supports online, VReplication-based resharding with only a few seconds of read-only downtime [3], plus automated failover via VTOrc/EmergencyReparentShard, hardened as recently as this year [4][5] | — | — |
 
 Most of the interesting engineering here is the middle of this table: YouTube didn't design Vitess or the transcode fan-out pipeline up front — both are responses to a simpler system hitting a wall.
 
@@ -369,7 +466,7 @@ When `vtgate` receives `SELECT ... WHERE video_id = 123`, it looks up `video`'s 
 
 Every `vttablet` also has a **tablet type**, and this is where the availability/consistency trade-off from [Requirements](#requirements) actually lives: `PRIMARY` is whichever replica currently accepts writes for a shard, `REPLICA` tablets are MySQL replicas eligible to be promoted to primary later and are conventionally used for live, user-facing reads, and `RDONLY` tablets are replicas that can never be promoted and are conventionally reserved for background/batch jobs so they don't compete with user traffic [21].
 
-A query can be routed to whichever tablet type fits its needs — the @Scale 2014 talk on YouTube's own backend describes exactly this split: **replica reads** for anything that doesn't need up-to-the-millisecond freshness, and **primary reads** reserved for the operations that do [8].
+A query can be routed to whichever tablet type fits its needs — the @Scale 2014 talk on YouTube's own backend describes exactly this split: **replica reads** for anything that doesn't need up-to-the-millisecond freshness, and **primary reads** reserved for the operations that do [8][18].
 
 This is a cheap, structural way to buy read scalability: replicas can be added just to absorb read load, entirely separate from write capacity, and a batch job scanning millions of rows for analytics can be pointed at `RDONLY` tablets so it never slows down anyone's video page load.
 
@@ -474,7 +571,7 @@ Automatic failover trades a small window of unavailability (however long detecti
 | 4. Connection drops | Client queries the session URL to learn how many bytes were actually received, then resumes from there instead of restarting [13] |
 | 5. Final chunk accepted | Server returns success; the file is now durably stored |
 
-Once the raw file is durably stored, transcoding is queued rather than done inline, and a fleet of workers fans the job out — traditionally CPU-based encoders (e.g. FFmpeg-class software), increasingly Google's own **Argos VCU** ASICs, which are purpose-built video (trans)coding units: two Argos chips per card, ten encoder cores per chip, each core able to encode 2160p at 60 fps in real time [14]. Google reports the VCU delivering 20–33x better compute efficiency than its prior all-software pipeline [1].
+Once the raw file is durably stored, transcoding is queued rather than done inline, and a fleet of workers fans the job out — traditionally CPU-based encoders (e.g. FFmpeg-class software), increasingly Google's own **Argos VCU** ASICs, which are purpose-built video (trans)coding units: two Argos chips per card, ten encoder cores per chip [14][19] (per-core real-time 2160p60 is unverified; not in the cited sources). Google reports the VCU delivering 20–33x better compute efficiency than its prior all-software pipeline [1].
 
 The hardware detail is worth sitting with, because it shows *why* a chip beats a CPU for this specific job. Each VCU accelerator pairs its ten encoder cores with four 32-bit LPDDR4-3200 memory channels (8 GB usable after error-correction overhead), needing roughly 27–37 GiB/s of memory bandwidth per accelerator — the design deliberately balances internal memory bandwidth against network throughput rather than chasing raw encode throughput alone, since a chip that can encode faster than the network can move bytes in and out gains nothing [19].
 
@@ -482,12 +579,12 @@ Production machines pack ten cards, each holding two VCUs over a PCIe Gen3 x16 l
 
 | Item | Detail | Source |
 |---|---|---|
-| Encoder cores per VCU chip | 10, each capable of real-time 2160p60 | [14][19] |
+| Encoder cores per VCU chip | 10 (per-core 2160p60 unverified) | [14][19] |
 | VCUs per card / server | 2 per card, 10 cards per server = 20 VCUs/server | [19] |
 | Memory per accelerator | 4x 32-bit LPDDR4-3200 channels, 8 GB usable after ECC, ~27–37 GiB/s bandwidth | [19] |
 | Card interconnect | PCIe Gen3 x16 | [19] |
 | NUMA-aware scheduling gain | +16–25% throughput | [19] |
-| Comparison baselines | Dual Intel Xeon Skylake servers; 4x Nvidia T4 GPU servers | [19] |
+| Comparison baselines | Dual Intel Xeon Skylake servers; Nvidia T4 GPU servers | [19] |
 | Net efficiency gain vs. baseline | 20–33x compute-efficiency-per-cost | [1][19] |
 
 Both H.264 and VP9 encoding run on the same chip, with VP9 doing the heavier lifting on the compression-efficiency side [19].
@@ -515,7 +612,7 @@ Fan-out also means a single video temporarily exists in an inconsistent set of r
 
 **The problem it solved:** network conditions vary constantly and unpredictably per viewer, mid-playback. A server can't reliably predict a client's available bandwidth in advance, and re-requesting a whole video every time bandwidth changes would be wasteful.
 
-**How it works internally:** YouTube re-encodes every upload into multiple codecs — H.264 for broad compatibility, VP9 as a more efficient default, and AV1 for further gains at greater encode cost — and multiple resolution/bitrate combinations per codec, then serves them via **DASH** (Dynamic Adaptive Streaming over HTTP) [1]. The player downloads a **manifest** listing every available rendition and its segment URLs, conceptually:
+**How it works internally:** YouTube re-encodes every upload into multiple codecs — H.264 for broad compatibility, VP9 as a more efficient default, and AV1 for further gains at greater encode cost — and multiple resolution/bitrate combinations per codec, then serves them via **DASH** (Dynamic Adaptive Streaming over HTTP) (DASH and the per-codec split are unverified; [1] only states VP9 costs ~5x H.264 to encode and AV1 compresses better than VP9 at higher compute). The player downloads a **manifest** listing every available rendition and its segment URLs, conceptually:
 
 ```text
 # illustrative structure of a DASH manifest — not an actual YouTube manifest
@@ -530,10 +627,10 @@ The player then requests short video **segments** one at a time; a client-side A
 | Codec | Relative bitrate vs. H.264 (same quality) | Relative encode cost | Notes |
 |---|---|---|---|
 | H.264 (AVC) | Baseline | Baseline (cheapest) | Broadest device compatibility [1] |
-| VP9 | ~40–45% lower bitrate | ~5x more compute to encode than H.264 | YouTube's more efficient default [1] |
-| AV1 | Lower still than VP9 | Higher again than VP9 | Reserved for higher-value/higher-resolution content [1][14] |
+| VP9 | lower bitrate (the ~40–45% figure is unverified) | ~5x more compute to encode than H.264 [1] | YouTube's more efficient default |
+| AV1 | Lower still than VP9 [1] | Higher again than VP9 [1] | Reserved for higher-value/higher-resolution content (unverified) |
 
-Cheap/fast H.264 encoding is generated for everything, while VP9/AV1 are prioritized for higher-resolution or higher-value content, because encoding every rendition in the most efficient codec for every upload simply isn't affordable at YouTube's volume [1]. The same underlying idea extends to live streaming, which YouTube's own infrastructure post notes grew substantially (daily livestreams up 45% in the first half of 2020) — live simply adds a much tighter deadline between a segment being encoded and it needing to reach a viewer [1].
+Cheap/fast H.264 encoding is generated for everything, while VP9/AV1 are prioritized for higher-resolution or higher-value content, because encoding every rendition in the most efficient codec for every upload simply isn't affordable at YouTube's volume (unverified; not stated in [1]). The same underlying idea extends to live streaming, which YouTube's own infrastructure post notes grew substantially (daily livestreams up 45% in the first half of 2020) — live simply adds a much tighter deadline between a segment being encoded and it needing to reach a viewer [1].
 
 **What it costs:** encoding every video into many codecs multiplies transcoding work per upload (this is part of why the ASIC investment above exists).
 
@@ -640,7 +737,7 @@ The workflow can be resumed or retried without having taken any downtime yet, si
 
 This is the same "fail closed, not open" instinct as the ERS timeout fix above, applied to a different mechanism.
 
-**A regional CDN/edge outage** (a specific GGC node inside an ISP goes down, or a peering PoP fails). Traffic for that region falls back to the next tier — another peering PoP or a regional cluster reached over Google's private backbone — rather than the public internet, because Google's edge network is deliberately structured as multiple fallback tiers rather than a single flat cache layer [12]. The cost is a latency regression for affected viewers (further round trip, more cache misses against origin) rather than an outage.
+**A regional CDN/edge outage** (a specific GGC node inside an ISP goes down, or a peering PoP fails). Traffic for that region falls back to the next tier — another peering PoP or a regional cluster reached over Google's private backbone — rather than the public internet, because Google's edge network has multiple tiers (GGC inside ISPs, edge PoPs at exchanges) [12] — the fallback behavior itself is inferred, not documented. The cost is a latency regression for affected viewers (further round trip, more cache misses against origin) rather than an outage.
 
 **A single rendition's transcode job crashes partway through** (say, the 1080p/AV1 worker OOMs, while every other resolution/codec succeeds). Because fan-out treats each resolution/codec pair as an independent task rather than one monolithic job, only that one task needs to be retried — the video doesn't go back to square one, and the renditions that already finished are simply left in place in Colossus. The video's `status` stays `Transcoding` a little longer rather than flipping to `Failed`, as long as *enough* renditions eventually succeed to make the video watchable.
 
@@ -655,7 +752,7 @@ Recap of the failure scenarios above and the specific design choice that contain
 | Transcode fleet falls behind under load | Durable write + async queue absorbs the backlog instead of failing uploads |
 | Resharding interrupted mid-flight | Old shard layout stays fully live; VReplication just resumes [6][20] |
 | `SwitchTraffic` can't safely cut over | Refuses to proceed past its lag/timeout thresholds rather than risk lost writes [20] |
-| Regional CDN/edge outage | Falls back to the next tier over Google's private backbone [12] |
+| Regional CDN/edge outage | Falls back to the next tier over Google's private backbone (inferred from the tiering in [12]) |
 | One rendition's transcode job crashes | Only that task retries; fan-out isolates it from other renditions |
 | ABR client picks a bad quality | Purely client-side correction; server/CDN stay uninvolved |
 
@@ -669,7 +766,7 @@ Recap of the failure scenarios above and the specific design choice that contain
 | Queue transcoding asynchronously instead of doing it inline on upload | Upload requests return fast; a slow/failed transcode never blocks or corrupts the raw file | Videos are visibly stuck "processing" for a while; creators wait |
 | Client-side adaptive bitrate (DASH) instead of server-side quality decisions | Keeps servers and CDN caches completely stateless and cacheable; server doesn't need per-client bandwidth state | Playback quality now depends on the client's ABR heuristic being good |
 | Cache edge nodes inside ISP networks (GGC) rather than only in Google's own facilities | Shrinks physical distance to viewers dramatically; keeps traffic off paid ISP transit [12] | Requires hardware/business relationships with thousands of independent ISPs |
-| Allow eventually-consistent replica reads in Vitess for tolerant data | Keeps read throughput high and available even during partial failure [8] | A user can briefly see a stale view count or comment count after a write |
+| Allow eventually-consistent replica reads in Vitess for tolerant data | Keeps read throughput high and available even during partial failure [8][18] | A user can briefly see a stale view count or comment count after a write |
 | Automatic failover via replication-position comparison (VTOrc/ERS) instead of manual promotion | No human required at 3am; faster recovery [4][5] | Risk of a wrong/premature promotion if detection logic is too eager (an actual bug class Vitess hardened against in 2026) [5] |
 | `vtgate` buffers queries during a `SwitchTraffic` cutover instead of erroring them | Application requests don't fail during a brief, planned migration window [20] | A short latency spike for in-flight requests while queries queue up behind the switch |
 | Automatically create a reverse-replication workflow on every resharding cutover | Cheap, fast rollback (`ReverseTraffic`) if something looks wrong immediately after switching [20] | Extra replication streams to maintain until the operator explicitly runs `complete` |
@@ -686,12 +783,14 @@ Recap of the failure scenarios above and the specific design choice that contain
 - **"How do you process one big, slow piece of work faster?"** — Split it into independent chunks, fan them out to a worker pool, and never let the slowest chunk block the others (transcode fan-out) [1][14].
 - **"How do you serve wildly different clients (phone on 3G, TV on fiber) the same content?"** — Pre-generate multiple resolution/codec renditions and let the client adaptively pick and switch between them; keep the server stateless (DASH/ABR).
 - **"How do you make a global service feel local?"** — Push a cache as physically close to the user as your business relationships allow — inside their own ISP if you can get there (Google Global Cache) [12].
-- **"How do you protect a database from a hot key/hot row?"** — Add connection pooling, query safety limits, and a row-level cache in front of the database so repeated hits on one row don't all reach it [9].
-- **"When is it OK to skip strong consistency?"** — Anywhere a briefly stale read is harmless (view counts, like counts) — but never on the write/ownership path that decides who controls a resource [8].
+- **"How do you protect a database from a hot key/hot row?"** — Add connection pooling, query safety limits, and a row-level cache in front of the database so repeated hits on one row don't all reach it [9][18].
+- **"When is it OK to skip strong consistency?"** — Anywhere a briefly stale read is harmless (view counts, like counts) — but never on the write/ownership path that decides who controls a resource [8][18].
 
 ## Glossary
 
-- **Sharding**: splitting one big database into smaller pieces by some key (e.g. an ID) so each machine holds only part of the data.
+New to these terms? The [concepts](../concepts/README.md) folder explains the core ideas in depth.
+
+- **[Sharding](../concepts/sharding.md)**: splitting one big database into smaller pieces by some key (e.g. an ID) so each machine holds only part of the data.
 - **Shard**: one partition of a sharded database — typically one MySQL primary plus its replicas, holding a disjoint slice of the rows.
 - **Keyspace**: Vitess's name for a logical database, which may be unsharded (one database) or sharded (split across many shards).
 - **Vindex** (primary vindex): the function — usually a hash — Vitess applies to a chosen column to decide which shard a row belongs to.
@@ -707,7 +806,7 @@ Recap of the failure scenarios above and the specific design choice that contain
 - **Resharding**: changing a database's sharding scheme (e.g. splitting one shard into two) without taking the database offline.
 - **VDiff**: a Vitess tool that compares source and target data during a resharding migration to confirm they match before cutover.
 - **Primary** (database): the single database instance allowed to accept writes for a given shard.
-- **Replica**: a read-only copy of a primary database, kept in sync via replication.
+- **[Replica](../concepts/replication.md)**: a read-only copy of a primary database, kept in sync via replication.
 - **Replication lag**: the delay between a write landing on the primary and that same write showing up on a replica.
 - **Topology service**: a small, highly-available coordination store (e.g. etcd or ZooKeeper) Vitess uses to track which tablet is the current primary for each shard.
 - **Transcoding**: converting a video file from one format/resolution/codec into another.
@@ -720,7 +819,7 @@ Recap of the failure scenarios above and the specific design choice that contain
 - **DASH** (Dynamic Adaptive Streaming over HTTP): a standard for delivering ABR video as small segments described by a manifest file.
 - **Manifest**: a file listing every available video rendition and the URLs/timing needed to fetch its segments.
 - **Segment / chunk**: a short slice of a video stream (a few seconds), fetched independently by the player.
-- **CDN** (Content Delivery Network): a network of servers positioned close to users that cache and serve content on behalf of an origin.
+- **[CDN](../concepts/cdn.md)** (Content Delivery Network): a network of servers positioned close to users that cache and serve content on behalf of an origin.
 - **Edge node**: a server at the outer edge of a network, physically close to end users, as opposed to a central data center.
 - **Google Global Cache (GGC)**: Google-supplied caching hardware installed physically inside partner ISPs' own networks.
 - **Peering / PoP** (Point of Presence): a location where two networks (e.g. Google's and an ISP's) physically connect and exchange traffic.
@@ -728,7 +827,7 @@ Recap of the failure scenarios above and the specific design choice that contain
 - **Colossus**: Google's internal, exabyte-scale cluster file system (successor to the Google File System).
 - **Bigtable**: Google's distributed, high-throughput key-value/wide-column storage system, used at Google for both internal and Cloud-facing workloads.
 - **Resumable upload**: an upload protocol that lets a client pause/resume/retry sending a large file in chunks instead of restarting from zero on failure.
-- **Fan-out**: splitting one piece of work into many parallel, independent pieces of work.
+- **[Fan-out](../concepts/fan-out.md)**: splitting one piece of work into many parallel, independent pieces of work.
 - **Storyboard / sprite sheet**: a single tiled image containing many small preview frames, used to avoid fetching hundreds of tiny separate images.
 - **QPS** (Queries Per Second): a measure of database or service load.
 - **Hot shard / hot key**: a single shard or single row receiving disproportionately more traffic than the rest of the system.
@@ -736,7 +835,7 @@ Recap of the failure scenarios above and the specific design choice that contain
 - **Row cache**: a cache layer that stores the result of common single-row database lookups to avoid repeatedly hitting the database.
 - **Connection pooling**: reusing a fixed set of database connections across many requests instead of opening a new one per request.
 - **Query safety / query blacklisting**: guardrails (row limits, timeouts, disallowed query patterns) that stop one bad or expensive query from overloading a database.
-- **Eventual consistency**: a read might return slightly stale data for a short time after a write, in exchange for higher availability/throughput.
+- **[Eventual consistency](../concepts/cap-and-consistency.md)**: a read might return slightly stale data for a short time after a write, in exchange for higher availability/throughput.
 - **Thundering herd**: a surge of simultaneous requests (e.g. for a suddenly-popular video) that overwhelms a system because they all miss any cache and hit the same backend at once.
 - **Vertical split**: moving a whole table, unsharded, into its own keyspace so it stops sharing I/O with busier tables.
 - **Horizontal split**: sharding a table's rows across many databases by a key, as opposed to moving a whole table.
@@ -751,7 +850,7 @@ Recap of the failure scenarios above and the specific design choice that contain
 
 ## Sources
 
-1. YouTube Blog — ["Reimagining video infrastructure to empower YouTube"](https://blog.youtube/inside-youtube/new-era-video-infrastructure/) (2020)
+1. YouTube Blog — ["Reimagining video infrastructure to empower YouTube"](https://blog.youtube/inside-youtube/new-era-video-infrastructure/) (April 2021)
 2. Vitess Docs — [History](https://vitess.io/docs/22.0/overview/history/)
 3. Vitess Docs — [Sharding](https://vitess.io/docs/archive/22.0/reference/features/sharding/)
 4. Vitess Docs — [VTOrc](https://vitess.io/docs/25.0/user-guides/configuration-basic/vtorc/)
@@ -769,6 +868,6 @@ Recap of the failure scenarios above and the specific design choice that contain
 16. FOSDEM 2014 — [Scaling with Go: YouTube's Vitess](https://archive.fosdem.org/2014/schedule/event/scaling_with_go:_youtubes_vitess/) *(conference talk listing)*
 17. Google — [Peering and Google Global Cache](https://peering.google.com/)
 18. ByteByteGo — ["How YouTube Supports Billions of Users with MySQL and Vitess"](https://blog.bytebytego.com/p/how-youtube-supports-billions-of) *(third-party)*
-19. ServeTheHome — ["Google YouTube VCU for Warehouse-scale Video Acceleration"](https://www.servethehome.com/google-youtube-vcu-for-warehouse-scale-video-acceleration/), covering Google's Hot Chips 2021 talk *(third-party)*
+19. ServeTheHome — ["Google YouTube VCU for Warehouse-scale Video Acceleration"](https://www.servethehome.com/google-youtube-vcu-for-warehouse-scale-video-acceleration/), covering Google's 2021 ACM paper on the VCU (April 2021) *(third-party)*
 20. Vitess Docs — [Reshard reference](https://vitess.io/docs/25.0/reference/vreplication/reshard/)
 21. Vitess Docs — [Tablet](https://vitess.io/docs/22.0/concepts/tablet/)

@@ -17,6 +17,7 @@
 - [Before you read: design it yourself](#before-you-read-design-it-yourself)
 - [The problem](#the-problem)
 - [Scale](#scale)
+- [Back-of-the-envelope math](#back-of-the-envelope-math)
 - [Requirements](#requirements)
 - [How it evolved](#how-it-evolved)
 - [High-level design](#high-level-design)
@@ -44,7 +45,7 @@ Narrow candidates cheaply first, then spend expensive compute only on the surviv
 <details>
 <summary>How Airbnb does it</summary>
 
-Retrieval narrows millions of listings down via two parallel paths: a traditional keyword/geo index, and embedding-based retrieval (EBR) — a two-tower neural net mapping the query and each listing into the same vector space. Airbnb picked an IVF index over the more common HNSW specifically because IVF tolerates Airbnb's high rate of real-time listing updates better. The merged candidates then go through a two-stage ranking pipeline: a gradient-boosted tree model first, then a deep neural net, with explicit corrections for positional bias and cold start. Trade-off: two retrieval systems and two ranking models both have to be trained, monitored, and kept from drifting apart, plus ongoing tuning to keep re-correcting for positional bias as ranking itself changes what guests click.
+Retrieval narrows millions of listings down via two parallel paths: a traditional keyword/geo index, and embedding-based retrieval (EBR) — a two-tower neural net mapping the query and each listing into the same vector space. Airbnb picked an IVF index over the more common HNSW specifically because IVF tolerates Airbnb's high rate of real-time listing updates better. Ranking itself evolved from a hand-written scoring function to a gradient-boosted tree model, then was replaced by a deep neural net once the tree model's gains plateaued, with explicit corrections for positional bias and cold start. Trade-off: two retrieval systems have to stay in sync and the ranking model has to be retrained and monitored, plus ongoing tuning to keep re-correcting for positional bias as ranking itself changes what guests click.
 
 Deep dive: [Search & ranking](#search--ranking)
 
@@ -139,25 +140,127 @@ This page answers three hard questions:
 
 | Metric | Number | Source |
 |---|---|---|
-| Active listings | ~9M (2025) | [15](#sources) *(third-party)* |
+| Active listings | ~8M (2025); 9.5M+ (2026) | [15](#sources) *(third-party)* |
 | Active users | ~275–290M (2024–2025) | [15](#sources) *(third-party)* |
-| Nights + Experiences booked | 492M (2024) | [15](#sources) *(third-party)* |
+| Nights + Experiences booked | 393.7M (2022) | [15](#sources) *(third-party)* |
 | Countries/regions with listings | 220+ | [15](#sources) *(third-party)* |
 | Payment countries supported | 191 | [10](#sources) |
 | Currencies supported | 70+ | [10](#sources) |
 | Payment processor routes | 24+ ("over two dozen") | [10](#sources) |
-| Local payment methods shipped | 20+ new methods in 14 months, out of 300+ identified globally (Pix, UPI, Naver Pay, M-Pesa, and others) | [12](#sources) |
-| Engineers (2015 → 2018) | ~90 → 1,000+ | [4](#sources) |
+| Local payment methods shipped | 20+ new methods in 14 months, out of 300+ identified globally (e.g. Pix, Naver Pay) | [12](#sources) |
+| Engineers (2014 → 2018) | ~90 → ~1,000 | [4](#sources) |
 | Services deployed via the SOA IDL framework (2018) | 250+ | [4](#sources) |
-| Weekly production deploys (before → after SOA, 2018) | ~3,000 → ~10,000 (roughly one per minute) | [4](#sources) |
+| Weekly production deploys (2017 → 2018) | ~3,000 → ~10,000 (roughly one per minute) | [4](#sources) |
 | Blocked-deploy time on Monorail (2015, ~200 engineers) | ~15 hours/week average, from reverts/rollbacks | [4](#sources) |
 
-Only numbers a source states. A few are worth sitting with: 492 million nights and experiences booked
-in a single year is over 15,000 a minute, around the clock — each one needing the search-to-payment
+Only numbers a source states. A few are worth sitting with: 393.7 million nights and experiences booked
+in a single year (2022) is about 750 a minute, around the clock — each one needing the search-to-payment
 pipeline below to work correctly. And "~15 hours a week of blocked deploys" doesn't sound like much
 until you multiply it by 200+ engineers all sharing one deploy queue — that's not a slow week, that's
 the whole engineering org's forward progress stalled for two work-days out of five, every single week,
 which is the number that actually forced the SOA migration described below.
+
+## Back-of-the-envelope math
+
+Back-of-the-envelope math is the rough, order-of-magnitude arithmetic engineers do on a whiteboard to size a system before building it — not a precise forecast. Inputs marked with a [n] reference are pulled straight from this page's Scale table; everything else is a labeled `Assumption:` used purely for illustration.
+
+### Booking write throughput
+
+**Question:** How many bookings per second does the availability system actually need to handle?
+
+**Inputs:**
+- Nights + Experiences booked: 393.7M (2022) [15](#sources) *(third-party)*
+- Assumption: peak traffic ≈ 2-3x daily average (use 3x)
+
+**Math:**
+```text
+avg_per_day = 393,700,000 / 365
+            ≈ 1,078,630 bookings/day
+
+avg_per_sec = 1,078,630 / 86,400
+            ≈ 12.48 bookings/sec
+
+peak (3x)   = 12.48 * 3
+            ≈ 37.4 bookings/sec
+```
+
+**Answer:** ~12-13 bookings/sec average, ~35-40/sec at peak.
+
+**What it tells you:** at a low double-digit per-second write rate, "never double-book a night" is a correctness problem under concurrency, not a raw-throughput one — a single well-designed exclusion constraint per listing-night handles this volume easily. The hard part, covered in [Availability calendar](#availability-calendar), is guaranteeing correctness while search is allowed to run seconds stale, not keeping up with the write rate itself.
+
+### Memory footprint of the listing-embedding search index
+
+**Question:** How big is the in-memory index the ranking pipeline searches against for every query?
+
+**Inputs:**
+- Active listings: 9.5M+ (2026) [15](#sources) *(third-party)*
+- Assumption: embedding dimension = 128 floats (typical two-tower model output size)
+- Assumption: 4 bytes per float32 value
+
+**Math:**
+```text
+bytes_per_listing = 128 floats * 4 bytes
+                   = 512 bytes
+
+total_index_size  = 9,500,000 listings * 512 bytes
+                   = 4,864,000,000 bytes
+                   ≈ 4.86 GB
+```
+
+**Answer:** ~4.9 GB for the full listing-embedding index.
+
+**What it tells you:** an index of just a few gigabytes fits comfortably in memory on a single modern server, so approximate-nearest-neighbor latency isn't a storage-size problem here — which is why the choice between IVF and HNSW in [Search & ranking](#search--ranking) comes down to how well each handles frequent listing updates, not raw memory savings.
+
+### Deploy-queue blocked time as a share of the work week
+
+**Question:** How much of the shared engineering week did ~15 blocked-deploy hours (2015) actually cost?
+
+**Inputs:**
+- Blocked-deploy time on Monorail (2015, ~200 engineers): ~15 hours/week average [4](#sources)
+- Assumption: standard work week = 40 hours
+
+**Math:**
+```text
+blocked_fraction = 15 hours / 40 hours
+                  = 0.375
+                  = 37.5%
+```
+
+**Answer:** ~37.5% of the work week — roughly 2 out of 5 workdays — the shared deploy pipeline was unusable company-wide.
+
+**What it tells you:** that's not one team's annoyance, it's a company-wide stall more than a third of every week — the concrete number the page itself cites as what actually forced the [SOA migration](#soa-migration-from-the-rails-monolith).
+
+### Payment-country vs. listing-country coverage gap
+
+**Question:** How much does payments infrastructure lag behind listings when it comes to country coverage?
+
+**Inputs:**
+- Countries/regions with listings: 220+ [15](#sources) *(third-party)*
+- Payment countries supported: 191 [10](#sources)
+
+**Math:**
+```text
+coverage_ratio = 191 / 220
+               ≈ 0.868
+               ≈ 86.8%
+
+gap            = 220 - 191
+               = 29 countries (≈13.2% of listing countries)
+```
+
+**Answer:** ~87% payment-country coverage relative to listing countries, leaving roughly 29 countries (~13%) without full localized payment support.
+
+**What it tells you:** that gap is exactly why the page describes "300+ local payment methods identified, only 20+ shipped in 14 months" as ongoing work rather than a solved problem — payments coverage structurally lags listings coverage. See [Booking & payments flow](#booking--payments-flow).
+
+### Rules of thumb used
+
+| Rule of thumb | Value |
+|---|---|
+| 1 day | ~86,400 s ≈ 10^5 s |
+| 1 year | ~365 days |
+| Peak vs. average traffic | ~2-3x, for a typical consumer app |
+
+These are general estimation conventions, not Airbnb-specific facts.
 
 ## Requirements
 
@@ -206,10 +309,10 @@ well-documented order:
 |---|---|---|---|---|
 | 2008–2014 | **Monorail**: one Ruby on Rails monolith, one shared database, ~90 engineers who could each reasonably understand the whole system | Nothing yet — this was the right architecture for the team size | — | [4](#sources) |
 | ~2015 | Monorail, now with 200+ engineers, ~200 commits/day | Modules had grown "too many responsibilities" and become tangled together; one message-handling module alone had 400+ contributors and thousands of lines; the team measured **~15 hours a week of average blocked-deploy time** from reverts and rollbacks — a shared deploy queue where one team's bad commit stalls everyone's releases | Data-ownership rules and a formal service-oriented architecture (SOA) migration begins | [4](#sources) |
-| 2015–2018 | SOA migration in progress: services get their own databases, talk over **Thrift**-defined RPC, publish changes as Kafka events via CDC | A single shared database had made every team's reliability dependent on every other team's queries; cross-team changes required coordinating a shared codebase | By 2018: 250+ services on the SOA IDL framework, ~1,000+ engineers, weekly deploys grown from ~3,000 to ~10,000 — roughly one *per minute* | [4](#sources), [5](#sources) |
+| 2015–2018 | SOA migration in progress: services get their own databases, talk over **Thrift**-defined RPC, publish changes as Kafka events via CDC | A single shared database had made every team's reliability dependent on every other team's queries; cross-team changes required coordinating a shared codebase | By 2018: 250+ services on the SOA IDL framework, ~1,000 engineers, weekly deploys grown from ~3,000 to ~10,000 — roughly one *per minute* | [4](#sources), [5](#sources) |
 | 2013 onward | **SmartStack**: Airbnb's homegrown service-discovery system (built in 2013, before hundreds of services existed) | Worked, but became an increasing maintenance burden as the service count grew into the hundreds — a hand-rolled system now competing with a mature open-source ecosystem | **AirMesh**, an Istio-based service mesh, migrated in over multiple years to carry the majority of production traffic | [8](#sources) |
 | 2016–2019 | A single, less-decomposed payments codebase, and ad hoc retry logic around external processor calls | Airbnb's global footprint (191 countries, 70+ currencies, 24+ processor integrations) meant one payments service couldn't let country/processor teams ship independently; ad hoc retries around non-idempotent external calls risked real double-charges | **Payments LTA** (domain-decomposed: pay-in, payout, ledger, settlement) and the **Orpheus** idempotency framework, layered on top | [10](#sources), [12](#sources), [13](#sources) |
-| 2019 onward | Hundreds of independent services, each with its own API, that client engineers had to individually discover and learn to call | Client-side engineers now needed to know *which of hundreds of services* to call for any given piece of data — the SOA migration had traded a monolith's tangle for a different kind of integration tax | **Viaduct**: one federated GraphQL schema over the SOA, where backend teams own a *module* of the schema rather than a whole server | [6](#sources), [7](#sources) |
+| 2019 onward | Hundreds of independent services, each with its own API, that client engineers had to individually discover and learn to call | Client-side engineers now needed to know *which of hundreds of services* to call for any given piece of data — the SOA migration had traded a monolith's tangle for a different kind of integration tax | **Viaduct**: one central GraphQL schema over the SOA, served by a shared multi-tenant runtime where backend teams own a *module* of the schema rather than a whole server | [6](#sources), [7](#sources) |
 | Later | Payments data fragmented correctly, but *by design*, across pay-in/payout/ledger/settlement services | Any consumer wanting "did this reservation get paid" had to query multiple services and reconcile the answer itself | **Unified Payments Data Read**: one read API composing the domain-decomposed services behind it | [14](#sources) |
 
 ```mermaid
@@ -219,7 +322,7 @@ timeline
     2015 - 2018 : SOA migration, Thrift IDL, data ownership rules, 250+ services
     2013 - 2020s : SmartStack service discovery replaced by AirMesh, an Istio-based mesh
     2016 - 2019 : Domain-decomposed Payments LTA and the Orpheus idempotency framework
-    2019 onward : Viaduct federated GraphQL data mesh over the SOA
+    2019 onward : Viaduct central-schema GraphQL data mesh over the SOA
 ```
 
 The throughline across every row: nothing here was replaced pre-emptively. Airbnb kept the simple
@@ -348,9 +451,9 @@ erDiagram
   }
 ```
 
-`CALENDAR_NIGHT` is the row that actually prevents double-booking: one row per `(listing_id, night_date)`, with a status of `open`, `held` (mid-checkout), or `booked`. Airbnb has confirmed that listings' calendar management is split out into its own partitioned domain, separate from the core booking-flow database, so it can scale independently [9](#sources). The keys are chosen deliberately: `CALENDAR_NIGHT` is keyed on `(listing_id, night_date)` rather than on `reservation_id` because the invariant that must hold is per-night, not per-reservation — a database-level uniqueness or exclusion constraint on that compound key is what makes "two confirmed reservations for the same night" structurally impossible rather than merely unlikely. `PAYMENT` sits between `RESERVATION` and `PAYOUT` as its own row (rather than folding payout fields directly onto the reservation) because a single payment fans out into potentially several payouts over time — a host's earnings for a long stay, for instance, or a payout that's split after a later adjustment.
+`CALENDAR_NIGHT` is the row that actually prevents double-booking: one row per `(listing_id, night_date)`, with a status of `open`, `held` (mid-checkout), or `booked`. Airbnb has not published how its calendar data is partitioned; its 2015 database post describes vertically partitioning tables by application function (the message inbox) off the main database [9](#sources), and a separate calendar partition here is a reference-design assumption (unverified). The keys are chosen deliberately: `CALENDAR_NIGHT` is keyed on `(listing_id, night_date)` rather than on `reservation_id` because the invariant that must hold is per-night, not per-reservation — a database-level uniqueness or exclusion constraint on that compound key is what makes "two confirmed reservations for the same night" structurally impossible rather than merely unlikely. `PAYMENT` sits between `RESERVATION` and `PAYOUT` as its own row (rather than folding payout fields directly onto the reservation) because a single payment fans out into potentially several payouts over time — a host's earnings for a long stay, for instance, or a payout that's split after a later adjustment.
 
-> **Note — simplified reference design.** Airbnb has not published the exact current schema or locking mechanism for the calendar. What *is* public is that (a) calendar data is owned by its own service/partition, separate from core booking tables [9](#sources), and (b) the SOA's data-ownership rule means only that service may write those rows [4](#sources). The concurrency mechanism shown here — one row per listing-night, moved through `open → held → booked` inside a single transaction (or with a short-TTL hold) — is a standard reference pattern for this class of problem (equivalent to a unique constraint or exclusion constraint on `(listing_id, night_date)` for confirmed bookings), not a confirmed description of Airbnb's internals.
+> **Note — simplified reference design.** Airbnb has not published the exact current schema or locking mechanism for the calendar. What *is* public is that (a) Airbnb prefers vertical partitions by application function (its 2015 example was the message inbox, not the calendar) [9](#sources), and (b) the SOA's data-ownership rule means only the owning service may write its data [4](#sources). The concurrency mechanism shown here — one row per listing-night, moved through `open → held → booked` inside a single transaction (or with a short-TTL hold) — is a standard reference pattern for this class of problem (equivalent to a unique constraint or exclusion constraint on `(listing_id, night_date)` for confirmed bookings), not a confirmed description of Airbnb's internals.
 
 ### 3. Search ranking pipeline
 
@@ -361,14 +464,13 @@ flowchart LR
   Retrieval --> EBR["Embedding-Based Retrieval (two-tower ANN)"]
   ES --> Merge["Candidate Set"]
   EBR --> Merge
-  Merge --> GBDT["Stage 1: Gradient Boosted Tree Scoring"]
-  GBDT --> DNN["Stage 2: Deep Neural Net Ranking"]
+  Merge --> DNN["Deep Neural Net Ranking (replaced earlier GBDT model)"]
   DNN --> Business["Business Rules (diversity, cold-start boost, quality)"]
   Business --> Results["Ranked Results Shown to Guest"]
 ```
 
-- **Retrieval** narrows millions of listings down to a candidate set two ways: a traditional keyword/geo/availability filter, and, more recently, **embedding-based retrieval (EBR)** — a two-tower neural network that encodes the query (location, guest count, stay length) and each listing (amenities, engagement, capacity) into vectors in a shared space, trained with contrastive learning on which listings users actually booked versus rejected. For serving, Airbnb chose an inverted-file-index (IVF) approach over HNSW because IVF handles the high rate of real-time listing updates better [3](#sources).
-- **Ranking** started as a hand-written scoring formula, then moved to a **gradient boosted decision tree (GBDT)** model in 2015 — "one of the largest step improvements in homes bookings in Airbnb's history" — and later to a **deep neural network** once the GBDT's gains plateaued [1](#sources).
+- **Retrieval** narrows millions of listings down to a candidate set two ways: a traditional keyword/geo/availability filter, and, more recently, **embedding-based retrieval (EBR)** — a two-tower neural network that encodes the query (location, guest count, stay length) and each listing (amenities, engagement, capacity) into vectors in a shared space, trained with contrastive learning on which listings users actually booked versus ones they saw but did not book. For serving, Airbnb chose an inverted-file-index (IVF) approach over HNSW because IVF handles the high rate of real-time listing updates better [3](#sources).
+- **Ranking** started as a hand-written scoring formula, then moved to a **gradient boosted decision tree (GBDT)** model — "one of the largest step improvements in homes bookings in Airbnb's history" — and later to a **deep neural network** once the GBDT's gains plateaued [1](#sources).
 - The 2020 follow-up paper describes three further problems they had to solve to keep improving the DNN: evolving the network architecture past a simple fully-connected two-layer net, correcting for **positional bias** (a listing ranked #1 gets more clicks partly *because* it's #1, which can poison training data if not corrected for), and handling **cold start** for brand-new listings with no booking history [2](#sources).
 
 ### 4. Availability state machine
@@ -410,24 +512,25 @@ embedding-based retrieval (EBR), where a two-tower neural network maps the query
 into the same vector space so "similar" can mean geometric closeness rather than exact keyword
 overlap. Airbnb picked an IVF index over the more common HNSW specifically because IVF tolerates
 Airbnb's real-time listing-update rate better [3](#sources) — a reminder that the "best" ANN
-algorithm on a benchmark isn't necessarily the best one for a specific write pattern. The merged
-candidate set then goes through two ranking stages: a gradient-boosted tree model first (2015's "one
-of the largest step improvements in homes bookings" [1](#sources)), then a deep neural network that
-picked up where the tree model's gains plateaued. The 2020 paper is candid about what actually made
+algorithm on a benchmark isn't necessarily the best one for a specific write pattern. Ranking has
+evolved over time: a gradient-boosted tree model first replaced a manual scoring function ("one
+of the largest step improvements in homes bookings" [1](#sources)), then a deep neural network replaced
+the tree model once its gains plateaued. The 2020 paper is candid about what actually made
 the DNN work in production, beyond just "add more layers": correcting for positional bias (a
 listing's rank itself inflates its click rate, which left uncorrected teaches the model that rank
 *causes* quality) and handling cold start (a brand-new listing has no booking history for the model to
-learn from, so it needs a separate boosting rule rather than being ranked purely on historical signal)
+learn from; Airbnb first tried an explicit ranking boost for new listings, then reframed the problem as
+predicting a new listing's missing engagement features)
 [2](#sources).
 
-> **Why this matters:** the two-stage GBDT-then-DNN pattern, and the explicit positional-bias
+> **Why this matters:** the GBDT-then-DNN evolution, and the explicit positional-bias
 > correction, generalize to almost any ranking system with human feedback loops (recommendation
 > feeds, ad ranking, search of any kind) — anywhere a model's own output influences the data it's
 > later trained on.
 
 **What it costs:** retrieval now runs two systems (keyword/geo index and a learned embedding index)
-that both have to stay in sync with the same underlying listing data, and a two-stage ranking
-pipeline means two models to train, monitor, and keep from drifting apart — plus an explicit,
+that both have to stay in sync with the same underlying listing data, and a deep ranking
+model has to be retrained and monitored — plus an explicit,
 ongoing engineering cost to keep re-measuring and re-correcting for positional bias as ranking itself
 changes what guests click on.
 
@@ -456,8 +559,8 @@ hand-write the RPC plumbing between their services. Changes propagate asynchrono
 possible: **SpinalTap**, Airbnb's change-data-capture (CDC) tool, watches a service's database write
 log and turns each row change into a Kafka event, so a listing update reaches the search index and
 other downstream consumers without the Listing Service needing to know who's listening or call them
-directly [4](#sources), [9](#sources). By 2018 this had scaled to 250+ services on the SOA IDL
-framework, supporting roughly 1,000+ engineers and a jump from ~3,000 to ~10,000 weekly production
+directly [4](#sources), [5](#sources). By 2018 this had scaled to 250+ services on the SOA IDL
+framework, supporting roughly 1,000 engineers and a jump from ~3,000 to ~10,000 weekly production
 deploys — about one deploy every minute, org-wide [4](#sources).
 
 ```
@@ -542,10 +645,10 @@ message and picks another. But the moment a guest is far enough into checkout to
 the system answering "is this still free" has to be right, every time, even when two checkouts for the
 same nights are racing each other in parallel across different servers.
 
-> Note: simplified reference design. Airbnb has confirmed publicly that calendar data is owned by its
-> own partitioned service, separate from the core booking database, so it scales independently
-> [9](#sources) — but it hasn't published the exact schema, locking primitive, or hold-TTL mechanism.
-> Everything below the confirmed fact of "it's its own partitioned domain" is a standard reference
+> Note: simplified reference design. Airbnb has not published how its calendar data is stored or
+> partitioned (its public partitioning post covers the message inbox, not the calendar [9](#sources)),
+> nor the exact schema, locking primitive, or hold-TTL mechanism.
+> Everything below, including "it's its own partitioned domain", is a standard reference
 > pattern for this class of problem, not a description of Airbnb's actual production internals.
 
 **How it works inside (reference design):** the natural way to make "two confirmed bookings for the
@@ -556,7 +659,7 @@ to cover the checkout window: long enough to complete a payment, short enough th
 releases the nights back to inventory automatically rather than needing a human or a cleanup job to
 notice. Because this table is the one place strong consistency is non-negotiable, it's kept as its
 own partitioned domain, separate from the higher-traffic-but-lower-stakes search index and listing
-metadata that can afford to be eventually consistent [9](#sources).
+metadata that can afford to be eventually consistent (reference design, unverified).
 
 > **Why this matters:** this is the clean, general version of a very common interview question — "how
 > do you prevent two people from getting the same scarce resource" (a concert seat, a hotel room, an
@@ -572,7 +675,7 @@ cannot, and has to accept the operational cost of staying strongly consistent un
 
 ### Data mesh: Viaduct
 
-**What it is:** a federated GraphQL layer sitting on top of the entire SOA, giving client engineers
+**What it is:** a central-schema GraphQL layer sitting on top of the entire SOA, giving client engineers
 one schema to query against instead of needing to know which of hundreds of backend services owns any
 given piece of data [6](#sources), [7](#sources).
 
@@ -584,21 +687,22 @@ each one and stitch the results together. Multiply that by hundreds of services 
 pays an integration tax just to gather data that conceptually "belongs together" on one page.
 
 **How it works inside:** rather than one team owning a monolithic GraphQL server (which would just
-recreate the original monolith's bottleneck, one layer up), Viaduct is explicitly federated — each
+recreate the original monolith's bottleneck, one layer up), Viaduct is a shared multi-tenant runtime (Airbnb contrasts it with GraphQL Federation, which
+distributes servers; Viaduct distributes modules) — each
 backend team owns a *module* of the overall schema, contributing the types and resolvers for the data
 their service owns, without needing write access to anyone else's module or knowledge of how the
 schema is assembled as a whole. A client then issues one GraphQL query naming the fields it wants
-across what were previously several service boundaries, and the federation layer fans that query out
-to the owning services' resolvers and stitches the response back together [6](#sources), [7](#sources).
+across what were previously several service boundaries, and the runtime runs the owning modules'
+resolvers and stitches the response back together [6](#sources), [7](#sources).
 
 > **Why this matters:** this is a recognizable, reusable pattern for any organization that has
 > successfully split a monolith into services and then discovered that client-side data-fetching
 > complexity simply moved rather than disappeared — federate the *query* layer without re-centralizing
 > *ownership* of the underlying data or the code that serves it.
 
-**What it costs:** a federated schema is still one shared, central *runtime* — even though the code
+**What it costs:** a central schema is still one shared, central *runtime* — even though the code
 behind each module stays decentralized, schema-level conflicts (two teams wanting to name or shape a
-field differently) now need centralized resolution, and the federation layer itself becomes a new
+field differently) now need centralized resolution, and the Viaduct runtime itself becomes a new
 piece of critical shared infrastructure that every client query passes through.
 
 ## What happens when things break
@@ -676,16 +780,16 @@ should have been.
 
 | Decision | Why | Trade-off |
 |---|---|---|
-| Split Monorail into a service-oriented architecture, not pure microservices | Rails monolith caused ~15 hours/week of blocked deploys from reverts/rollbacks as engineering scaled from ~90 to 1,000+ people; SOA (shared data-owning services, not one-service-per-team-forever) let teams deploy independently while still reusing common business logic [4](#sources), [5](#sources) | More operational surface area (hundreds of services to run, monitor, and version) and cross-service consistency becomes an application-level problem instead of a single-database transaction |
+| Split Monorail into a service-oriented architecture, not pure microservices | Rails monolith caused ~15 hours/week of blocked deploys from reverts/rollbacks as engineering scaled from ~90 (2014) to ~1,000 (2018) people; SOA (shared data-owning services, not one-service-per-team-forever) let teams deploy independently while still reusing common business logic [4](#sources), [5](#sources) | More operational surface area (hundreds of services to run, monitor, and version) and cross-service consistency becomes an application-level problem instead of a single-database transaction |
 | Each service owns its own data (data-ownership principle) | Prevents the "everyone reads and writes everyone's tables" tangle that made the monolith fragile [4](#sources) | Reads that need data from two domains (e.g., "show me a booking with its listing details") now need an API call or a caching layer instead of a SQL join |
-| Kafka event bus fed by change-data-capture (SpinalTap) instead of synchronous cross-service calls for propagating changes | Keeps services loosely coupled; a spike in search-indexing load shouldn't be able to slow down booking [4](#sources), [9](#sources) | Search index and calendar caches are only eventually consistent with the source of truth — a booking can very briefly still appear available in search |
+| Kafka event bus fed by change-data-capture (SpinalTap) instead of synchronous cross-service calls for propagating changes | Keeps services loosely coupled; a spike in search-indexing load shouldn't be able to slow down booking [4](#sources), [5](#sources) | Search index and calendar caches are only eventually consistent with the source of truth — a booking can very briefly still appear available in search |
 | Idempotency framework (Orpheus) on every payment call instead of database 2PC across services | Payments span internal services *and* external processors that don't support distributed transactions; idempotency keys + retryable/non-retryable classification give exactly-once *effect* on top of Kafka's at-least-once delivery [13](#sources) | Extra bookkeeping table and pre/post-RPC phases on every payment call; more code than "just retry and hope" |
 | Append-only, double-entry-style payments ledger | Financial data must be auditable and reconstructable; mutating a balance in place loses history [10](#sources) | More storage, and reads that want "current balance" must aggregate rather than read one row |
 | Domain-decomposed payments platform (pay-in, payout, ledger, settlement as separate subdomains) instead of one payments service | Airbnb operates in 191 countries with 70+ currencies and two dozen-plus processor integrations — a monolithic payments service couldn't let country/processor teams ship independently [10](#sources), [12](#sources) | More services to coordinate for a single "did this reservation get paid" answer; motivated the later "unified payments data read" project to give consumers one read API instead of many [14](#sources) |
 | Service mesh evolution: SmartStack → AirMesh (built on Istio) | Homegrown service discovery (SmartStack, 2013) worked but became a maintenance burden at hundreds of services; adopting Istio-based AirMesh let Airbnb get mesh features (routing, retries, mTLS) from an ecosystem instead of hand-rolling them | Migrating >90% of production traffic to a new mesh is itself a multi-year project with its own latency-tuning work (e.g., propagation delay) [8](#sources) |
-| Data-oriented service mesh (Viaduct, GraphQL) on top of the SOA | Hundreds of services meant client engineers had to know which of many services to call for what; Viaduct gives one federated GraphQL schema where teams own a *module*, not a whole server [6](#sources), [7](#sources) | A single shared runtime is a new central dependency; schema conflicts between teams must be resolved centrally even though code is decentralized |
-| Availability held as a strongly-consistent partition, separate from eventually-consistent search | The one invariant that can never be violated (no double-booking) needs to be isolated from the parts of the system that can tolerate staleness, so it can be reasoned about and scaled differently [9](#sources) | This partition can't use the same cheap, eventually-consistent scaling tricks (aggressive caching, async propagation) the rest of the system relies on |
-| Federated GraphQL (Viaduct) over the SOA, with each backend team owning one schema module | Client engineers otherwise need to know which of hundreds of services owns each piece of data and manually stitch results together per feature [6](#sources), [7](#sources) | The federation runtime itself becomes new shared, central infrastructure; schema-shape conflicts between teams now require centralized resolution even though ownership of the underlying code stays decentralized |
+| Data-oriented service mesh (Viaduct, GraphQL) on top of the SOA | Hundreds of services meant client engineers had to know which of many services to call for what; Viaduct gives one central GraphQL schema where teams own a *module*, not a whole server [6](#sources), [7](#sources) | A single shared runtime is a new central dependency; schema conflicts between teams must be resolved centrally even though code is decentralized |
+| Availability held as a strongly-consistent partition, separate from eventually-consistent search | The one invariant that can never be violated (no double-booking) needs to be isolated from the parts of the system that can tolerate staleness, so it can be reasoned about and scaled differently (reference design; Airbnb has not published its calendar partitioning) | This partition can't use the same cheap, eventually-consistent scaling tricks (aggressive caching, async propagation) the rest of the system relies on |
+| Central-schema GraphQL (Viaduct) over the SOA, with each backend team owning one schema module | Client engineers otherwise need to know which of hundreds of services owns each piece of data and manually stitch results together per feature [6](#sources), [7](#sources) | The Viaduct runtime itself becomes new shared, central infrastructure; schema-shape conflicts between teams now require centralized resolution even though ownership of the underlying code stays decentralized |
 
 ## Interview takeaways
 
@@ -714,28 +818,30 @@ should have been.
 - **A measured, specific pain point (15 hours/week of blocked deploys) is what justifies a costly
   migration — not architecture for its own sake.** Answers: "how do you know when it's actually time to
   break up a monolith?" (You have a number, not a vibe.)
-- **A two-stage ranking pipeline (cheap model first, expensive model second) plus explicit correction
-  for feedback-loop bias (positional bias, cold start).** Answers: "how do you rank at scale when a
-  full deep model is too slow to run on every candidate, and the model's own past output is
+- **A ranking model that evolved from GBDT to a DNN, plus explicit correction
+  for feedback-loop bias (positional bias, cold start).** Answers: "how do you keep improving ranking
+  once a model plateaus, when the model's own past output is
   contaminating its training data?"
 
 ## Glossary
 
+New to these terms? The [concepts](../concepts/README.md) folder explains the core ideas in depth.
+
 - **Monolith**: one big application where all the code (search, booking, payments, etc.) is built, tested, and deployed together as a single unit.
 - **SOA (service-oriented architecture)**: splitting that one big application into many smaller programs ("services"), each responsible for one area, that talk to each other over the network instead of function calls.
-- **Microservices**: a stricter, finer-grained version of SOA where services are small and independently owned; Airbnb deliberately describes its approach as SOA rather than microservices because it kept more shared libraries/services than a pure microservices approach would.
+- **[Microservices](../concepts/microservices.md)**: a stricter, finer-grained version of SOA where services are small and independently owned; Airbnb deliberately describes its approach as SOA rather than microservices because it kept more shared libraries/services than a pure microservices approach would.
 - **API gateway**: the front door all client requests go through, which then forwards ("routes") each request to the right backend service.
-- **Sharding / partitioning**: splitting one big database into smaller pieces (e.g., by listing ID) so no single machine has to hold or serve all the data.
+- **[Sharding / partitioning](../concepts/sharding.md)**: splitting one big database into smaller pieces (e.g., by listing ID) so no single machine has to hold or serve all the data.
 - **Service mesh**: infrastructure that handles the plumbing between services — finding the right server to talk to (service discovery), retrying failed calls, encrypting traffic — so each service's code doesn't have to.
 - **RPC (remote procedure call)**: calling a function that actually runs on a different machine/service, made to look like a normal function call.
 - **Thrift / IDL (interface definition language)**: a way to describe a service's API once and auto-generate the client/server code for it in multiple programming languages, so two services can talk without hand-writing the plumbing.
-- **Kafka / event bus**: a system where services publish "this happened" messages (events) that other services can subscribe to, instead of calling each other directly.
+- **[Kafka / event bus](../concepts/message-queues-and-logs.md)**: a system where services publish "this happened" messages (events) that other services can subscribe to, instead of calling each other directly.
 - **CDC (change data capture)**: automatically watching a database's write log and turning every row change into an event, so other systems can react to changes without the writer needing to know who's listening.
-- **Idempotency**: a request that has the exact same effect no matter how many times you (accidentally) repeat it — critical for payments, where a network retry must never charge someone twice.
+- **[Idempotency](../concepts/idempotency.md)**: a request that has the exact same effect no matter how many times you (accidentally) repeat it — critical for payments, where a network retry must never charge someone twice.
 - **Ledger**: an append-only record of every financial movement (charges, fees, payouts) that is never edited in place, only added to — so you can always reconstruct history and catch errors.
 - **Double-entry bookkeeping**: an accounting method where every transaction is recorded as a matched pair of entries (e.g., money leaves the guest's charge, money is accrued to the host's payout) so the books always balance.
-- **Eventual consistency**: a system where, after a write, other parts of the system will *eventually* see it — but maybe not immediately. Fine for search results; not fine for double-booking.
-- **Strong consistency**: a system where a write is immediately visible/enforced everywhere that needs it — required for "has this night already been booked?"
+- **[Eventual consistency](../concepts/cap-and-consistency.md)**: a system where, after a write, other parts of the system will *eventually* see it — but maybe not immediately. Fine for search results; not fine for double-booking.
+- **[Strong consistency](../concepts/cap-and-consistency.md)**: a system where a write is immediately visible/enforced everywhere that needs it — required for "has this night already been booked?"
 - **Ranking model**: the algorithm that decides in what order to show search results; here evolved from a hand-written formula, to a gradient boosted decision tree, to a deep neural network.
 - **GBDT (gradient boosted decision tree)**: a machine-learning model made of many small decision trees, each one correcting the errors of the ones before it; good at handling messy, mixed types of features without much manual tuning.
 - **Deep neural network (DNN)**: a machine-learning model made of stacked layers of simple math units, capable of learning more complex patterns than a decision tree, at the cost of being more data-hungry and harder to interpret.

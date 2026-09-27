@@ -13,7 +13,7 @@ flowchart LR
   C["Client"] -->|"WebSocket"| GW["Gateway (Elixir)"]
   GW --> SESS["Session process<br/>per connection"]
   SESS --> GUILD["Guild process<br/>per server"]
-  GUILD -->|"Manifold fan-out"| RELAY["Relay workers<br/>~20 nodes"]
+  GUILD -->|"Manifold fan-out"| RELAY["Worker on each<br/>remote node"]
   RELAY --> SESS2["Sessions across cluster"]
   GUILD --> DS["Message data service (Rust)"]
   DS --> SCY[("ScyllaDB<br/>bucketed by channel")]
@@ -30,7 +30,7 @@ A guild process never talks to sessions directly — Manifold's relay workers do
 |---|---|---|
 | Concurrent users (chat infra) | 5 million (2017) | [Discord Engineering](https://discord.com/blog/how-discord-scaled-elixir-to-5-000-000-concurrent-users) |
 | Elixir microservices | 20+, run by a 5-person team (Oct 2020) | [elixir-lang.org](https://elixir-lang.org/blog/2020/10/08/real-time-communication-at-scale-with-elixir-at-discord/) |
-| Monthly active users | 200 million+ (2023-2024) | [Business of Apps](https://www.businessofapps.com/data/discord-statistics/) |
+| Monthly active users | 200 million (2023, estimate) | [Business of Apps](https://www.businessofapps.com/data/discord-statistics/) |
 | WebSocket events sent/sec | 26 million (Oct 2020) | [elixir-lang.org](https://elixir-lang.org/blog/2020/10/08/real-time-communication-at-scale-with-elixir-at-discord/) |
 | ScyllaDB cluster size (post-migration) | 72 nodes, down from 177 on Cassandra | [Discord Engineering](https://discord.com/blog/how-discord-stores-trillions-of-messages) |
 | Largest guild (Maxjourney) | 10 million+ members, 1 million+ concurrently online | [Discord Engineering](https://discord.com/blog/maxjourney-pushing-discords-limits-with-a-million-plus-online-users-in-a-single-server) |
@@ -72,7 +72,7 @@ A guild process never talks to sessions directly — Manifold's relay workers do
 - "Just add more nodes" doesn't explain the ScyllaDB move — Cassandra was still scaling fine; the *operational cost* (GC pauses, compaction, on-call load) at 177 nodes was the real trigger.
 - Passive sessions are easy to mistake for a caching trick — they're really about cutting the number of full-fidelity recipients, not caching a response.
 - The March 2026 outage wasn't one bug — it cascaded through four separate systems (pods, Gateway, voice syncer, call routing) because none had a graceful-degradation plan for "a third of my peers just vanished."
-- Manifold and Maxjourney are easy to conflate — Manifold (2017) solved fan-out up to tens of thousands of members; Maxjourney (2022) solved a harder version of the *same* problem two more orders of magnitude later.
+- Manifold and Maxjourney are easy to conflate — Manifold (2017) solved fan-out up to tens of thousands of members; Maxjourney (written up 2023) solved a harder version of the *same* problem two more orders of magnitude later.
 - "Passive session" doesn't mean disconnected — the client still holds an open connection, it just receives a stripped-down event stream instead of the full one.
 
 ## See also

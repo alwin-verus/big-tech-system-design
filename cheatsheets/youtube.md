@@ -27,13 +27,13 @@ flowchart LR
 
 | Metric | Number | Source |
 |---|---|---|
-| Video uploaded | 500+ hours of video uploaded every minute (2020) | [Reimagining video infrastructure](https://blog.youtube/inside-youtube/new-era-video-infrastructure/) |
-| Transcoding efficiency gain (Argos VCU vs. CPU) | 20–33x compute efficiency (2020) | [Reimagining video infrastructure](https://blog.youtube/inside-youtube/new-era-video-infrastructure/) |
+| Video uploaded | 500+ hours of video uploaded every minute (stated April 2021) | [Reimagining video infrastructure](https://blog.youtube/inside-youtube/new-era-video-infrastructure/) |
+| Transcoding efficiency gain (Argos VCU vs. CPU) | 20–33x compute efficiency (stated April 2021) | [Reimagining video infrastructure](https://blog.youtube/inside-youtube/new-era-video-infrastructure/) |
 | YouTube's growth after adopting Vitess | Scaled by more than 50x | [Vitess history](https://vitess.io/docs/22.0/overview/history/) |
 | Google Global Cache footprint | 1,300+ cities across 200+ countries and territories | [Google Cloud network edge points](https://cloud.google.com/blog/products/networking/understanding-google-cloud-network-edge-points) |
 | Colossus scale | Exabytes of storage across tens of thousands of machines per cluster | [A peek behind Colossus](https://cloud.google.com/blog/products/storage-data-transfer/a-peek-behind-colossus-googles-file-system) |
 | Bigtable scale | 6B+ requests/sec at peak, 10+ exabytes managed | [YouTube runs on Bigtable](https://cloud.google.com/blog/products/databases/youtube-runs-on-bigtable/) |
-| Argos VCU chips | "Thousands" deployed; each chip has 10 encoder cores, each real-time 2160p60 (2021) | [9to5Google: Argos VCU chip](https://9to5google.com/2021/04/22/youtube-google-custom-chip/) |
+| Argos VCU chips | Deployed in Google data centers; each chip has 10 encoder cores, two chips per board (2021) | [9to5Google: Argos VCU chip](https://9to5google.com/2021/04/22/youtube-google-custom-chip/) |
 
 ## Signature ideas
 

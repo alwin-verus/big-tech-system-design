@@ -23,6 +23,7 @@
 - [Before you read: design it yourself](#before-you-read-design-it-yourself)
 - [The problem](#the-problem)
 - [Scale](#scale)
+- [Back-of-the-envelope math](#back-of-the-envelope-math)
 - [Requirements](#requirements)
 - [How it evolved](#how-it-evolved)
 - [High-level design](#high-level-design)
@@ -156,6 +157,120 @@ goal for the whole fleet pinging in every ~4 seconds, not a number Uber says it 
 but it tells you the geo-index was built to be write-heavy, not read-heavy, which shapes almost
 every other decision downstream of it.
 
+## Back-of-the-envelope math
+
+This is the rough arithmetic engineers sketch on a whiteboard to size a system before writing any code — good enough to catch a design that's off by orders of magnitude, not meant to be exact. Inputs marked [n] are pulled straight from the [Scale](#scale) table above and match it exactly; everything else is an explicit **Assumption**, never presented as fact.
+
+### 1. Trip-request rate: average vs. peak
+
+**Question:** Given >40 million trips/day [14](#sources), what's the average trip-request rate, and what does that imply for peak load on DISCO's batch window?
+
+**Inputs:**
+- Trips per day: 40,000,000 [14](#sources)
+- 1 day = 86,400 s (rule of thumb)
+- Assumption: peak load runs ~3x the daily average (rush hours, weekend nights, and events cluster
+  demand, per this page's own [Scale](#scale) interpretation)
+
+**Math:**
+```text
+average rate = 40,000,000 trips / 86,400 s
+             = 462.96 trips/sec  (~460/sec)
+
+peak rate = 460 trips/sec × 3
+          = 1,389 trips/sec  (~1,400/sec)
+```
+
+**Answer:** ~460 trips/sec average, ~1,400/sec at peak.
+
+**What it tells you:** DISCO's batch window has to clear 1,000+ open requests/sec at peak, not the ~460/sec average — a big part of why matching is batched and optimized as a group instead of handled one request at a time. See [DISCO: the dispatch optimizer](#disco-the-dispatch-optimizer).
+
+### 2. How many concurrent drivers would saturate the location-write design target
+
+**Question:** The geo-index was built for a ~1 million writes/sec target with drivers pinging every
+~4 seconds [11](#sources)[12](#sources) — how many concurrent drivers would generate that load?
+
+**Inputs:**
+- Target write throughput: ~1,000,000 writes/sec (design goal) [11](#sources)[12](#sources)
+- Ping interval: ~4 sec/driver [11](#sources)[12](#sources)
+
+**Math:**
+```text
+writes/sec per driver = 1 ping / 4 sec
+                       = 0.25 writes/sec/driver
+
+drivers needed = 1,000,000 writes/sec ÷ 0.25 writes/sec/driver
+               = 4,000,000 concurrently-pinging drivers
+```
+
+**Answer:** ~4 million drivers pinging at once would be needed to saturate the design target.
+
+**What it tells you:** Uber doesn't publish a live concurrent-driver count, so this is a design ceiling, not today's load — the geo-index / [Ringpop](#ringpop-the-self-organizing-cluster) layer was deliberately over-built with headroom above any plausible near-term fleet size.
+
+### 3. Storage cost if location pings were persisted instead of kept in memory
+
+**Question:** If the ~1 million writes/sec location-ping stream were durably stored instead of living only in Ringpop's in-memory ring, how much raw storage would one day generate?
+
+**Inputs:**
+- Target write throughput: ~1,000,000 writes/sec [11](#sources)[12](#sources)
+- 1 day = 86,400 s (rule of thumb)
+- Assumption: ~100 bytes per ping record (driver ID + lat/lng + H3 cell ID + timestamp, compactly
+  encoded)
+
+**Math:**
+```text
+writes/day = 1,000,000 writes/sec × 86,400 sec/day
+           = 86,400,000,000 writes/day  (8.64 × 10^10)
+
+storage/day = 86,400,000,000 writes × 100 bytes
+            = 8,640,000,000,000 bytes
+            = 8.64 TB/day  (1 TB ≈ 10^12 bytes)
+```
+
+**Answer:** ~8.6 TB/day, for one un-replicated copy of raw pings alone.
+
+**What it tells you:** a modest number by database standards — the real reason this data lives in
+memory on [Ringpop](#ringpop-the-self-organizing-cluster) isn't storage volume, it's freshness:
+"database storage would be useless because of how fleeting the location data is."
+
+### 4. Headroom in the geofence lookup service at its published NYE peak
+
+**Question:** The geofence service hit 170,000 queries/sec across 40 machines at only 35% CPU on NYE 2015 [6](#sources) — how much more load could that same fleet absorb before CPU saturates?
+
+**Inputs:**
+- Geofence peak: 170,000 queries/sec across 40 machines at 35% CPU [6](#sources)
+- Assumption: CPU-to-throughput scaling is roughly linear up to 100% (a simplification — real
+  systems usually hit a different bottleneck, like lock contention or network, before CPU actually
+  saturates)
+
+**Math:**
+```text
+QPS/machine at 35% CPU = 170,000 / 40
+                        = 4,250 QPS/machine
+
+QPS/machine at 100% CPU (linear) = 4,250 / 0.35
+                                   = 12,142.9 QPS/machine
+
+fleet capacity at 100% CPU = 12,142.9 × 40
+                            = 485,714 QPS
+
+extra headroom over the NYE peak = 485,714 - 170,000
+                                   = 315,714 QPS  (~2.9x the observed peak)
+```
+
+**Answer:** ~486,000 QPS of theoretical fleet capacity — roughly 2.9x above the actual NYE peak.
+
+**What it tells you:** 35% CPU at the single most extreme demand spike Uber has published numbers for was a deliberate design margin, not luck. See [What happens when things break](#what-happens-when-things-break).
+
+**Rules of thumb used:**
+
+| Convention | Value used here |
+|---|---|
+| 1 day | ≈ 86,400 s (≈10^5 s for quick mental math) |
+| Peak vs. average | peak load ≈ 2-3x the daily average for systems with rush-hour/event clustering |
+| "~X" design targets | treated as exactly X for arithmetic, since the page states it as a goal, not a measurement |
+| CPU-to-throughput scaling | assumed roughly linear when projecting extra headroom (a simplification; real systems usually hit a different bottleneck first) |
+| Storage unit | 1 TB ≈ 10^12 bytes (decimal, not binary TiB) |
+
 ## Requirements
 
 **Functional:**
@@ -207,8 +322,8 @@ every other decision downstream of it.
 | October 2014 | **Schemaless** goes to production: an in-house datastore on sharded MySQL | None of the evaluated alternatives (Cassandra, Riak, MongoDB) cleared Uber's bar on all five requirements at once: linear scalability, write availability, change notifications, secondary indexes, and — critically — operational trust at Uber's own hands | [2](#sources)[3](#sources) |
 | 2015 | Real-time market platform rearchitected: Supply and Demand abstracted into standalone services, **DISCO** introduced for dispatch, Google's **S2** library used for the geo-index (level-12 cells), **Ringpop** used to shard the geo-index and Supply service across processes, driver phones used as a backup state store for datacenter failover | The 2014 system could only match currently-idle supply and couldn't plan ahead; a rewrite (not a patch) was needed to support planning into the future and considering mid-trip drivers as future candidates | [11](#sources)[12](#sources) |
 | 2016 | Edge layer formalized: NGINX (TLS/auth) → HAProxy → 600+ stateless "Frontline" API endpoints in Node.js, in front of an already-large and fast-changing set of microservices | Hundreds of interdependent microservices made a single architecture diagram obsolete almost as soon as it was drawn; a stable public-facing edge was needed regardless of what churned behind it | [9](#sources)[10](#sources) |
-| 2018 | **H3** open-sourced: hexagonal hierarchical spatial index, generalizing/replacing S2-based square-ish cells for dispatch, surge pricing, and demand analysis | S2's square-derived cells have two different neighbor distances (edge vs. corner), which complicates uniform proximity math and ring-based "expand the search radius" logic at Uber's scale | [1](#sources) |
-| ~2018 onward | Node.js/HTTP-JSON stack marked no longer Uber's recommended default; **DeepETA** (deep learning) begins replacing XGBoost gradient-boosted trees for ETA refinement | Training data and model size had outgrown what gradient-boosted ensembles could scale to, even after Uber upstreamed its own scaling improvements into XGBoost around 2017–2018 | [7](#sources)[8](#sources) |
+| 2018 | **H3** open-sourced: hexagonal hierarchical spatial index for dispatch, surge pricing, and demand analysis (Uber's H3 post doesn't mention S2; "replacing S2" is inference) | Square cells have two different neighbor distances (edge vs. corner), which complicates uniform proximity math and ring-based "expand the search radius" logic at Uber's scale | [1](#sources) |
+| ~2018 onward | Node.js/HTTP-JSON stack marked no longer Uber's recommended default; **DeepETA** (deep learning) begins replacing XGBoost gradient-boosted trees for ETA refinement | Training data and model size had outgrown what gradient-boosted ensembles could scale to, even after Uber upstreamed its own scaling improvements into XGBoost | [7](#sources)[8](#sources) |
 | 2019–2021 | Legacy Fulfillment stack (rt-demand/rt-supply + Cassandra + Redis + Ringpop) hits an engineering-debt wall: 400+ engineers touching a system with no clear extension model, redundant dual-cluster writes for availability, Ringpop's peer-to-peer gossip capping how far city-pod sharding could scale | Consistency was only best-effort by design, coordinating writes across Trip and Supply entities needed ad hoc RPC choreography, and the system had no first-class way to add new fulfillment types | [7](#sources) |
 | 2021 | **Fulfillment Platform** rewrite ships: Google Cloud Spanner (NewSQL) replaces Cassandra/Redis, statecharts model each entity's lifecycle, a Business Transaction Coordinator handles cross-entity transactions, and a custom LATE (Latent Asynchronous Task Execution) component fills the gap left by Spanner not having built-in change-data-capture | Built by 100+ engineers across 30+ teams over about two years, after six months auditing every product and gathering 200+ pages of requirements, to support >1M concurrent users and 10,000+ cities on one platform instead of one-off per-vertical systems | [7](#sources) |
 | 2025 | >40M trips/day, >200M monthly active consumers, $54.1B gross bookings in a single quarter | Scale keeps compounding on top of the 2021 rewrite | [14](#sources) |
@@ -243,7 +358,6 @@ flowchart LR
   Disco --> ETASvc
   Disco --> Pricing
   Supply --> Kafka
-  Kafka --> GeoIndex
   Kafka --> Pricing
   Disco --> TripStore
   Supply --- SupplyRing
@@ -275,9 +389,10 @@ Walking through it:
    [8](#sources).
 6. **DISCO → Pricing/Surge Service.** Pricing reads the same local supply/demand signal to decide
    whether — and how much — to surge a given area [1](#sources).
-7. **Supply → Kafka → Geo Index / Pricing.** Driver location pings and trip lifecycle events stream
-   through Kafka, feeding both the geo index (so it knows current driver positions) and pricing (so
-   surge reacts to real conditions) [9](#sources)[13](#sources).
+7. **Supply → Kafka → Geo Index / Pricing.** Trip data and rider/driver status stream through Kafka
+   into the surge-pricing pipeline, which computes multipliers per hexagon area [13](#sources); Kafka
+   also carries mobile-app and service events [9](#sources). (Kafka feeding the geo index is an
+   illustrative assumption — the cited sources don't describe it.)
 8. **DISCO → Schemaless.** Once a match is made, the trip record is written to Schemaless, Uber's
    in-house datastore built on sharded MySQL [2](#sources)[3](#sources).
 9. **Ringpop rings.** Both the Supply service and the Geo Index are examples of services that use
@@ -456,10 +571,10 @@ cells at 16 zoom levels ("resolutions"), so any GPS point can be converted into 
 and compared cheaply against neighboring cells [1](#sources).
 
 **The problem it solved.** Before H3, Uber's options for "what area is this point in" were postal
-codes, hand-drawn city/neighborhood zones, or Google's S2 library. Postal codes have irregular
+codes, hand-drawn city/neighborhood zones [1](#sources), or Google's S2 library [12](#sources). Postal codes have irregular
 shapes that change for reasons unrelated to ride-hailing. Hand-drawn zones need constant manual
 upkeep and arbitrarily define their own edges. S2's cells (derived from projecting a cube onto a
-sphere) are square-like, and a square has two different neighbor distances — edge-adjacent and
+sphere) are square-like [12](#sources), and a square has two different neighbor distances — edge-adjacent and
 corner-adjacent — which complicates any "how many rings of neighbors do I need to check" calculation
 used across dispatch, surge pricing, and demand analysis [1](#sources).
 
@@ -554,7 +669,7 @@ buildings block or bounce satellite signal (multipath reflection) [5](#sources).
 driver roughly is, "how long until they arrive" from a routing engine's raw estimate is often wrong
 in ways that are systematically correctable — but Uber's older correction model, gradient-boosted
 decision trees (XGBoost), had scaled about as far as tree ensembles reasonably could, even after
-Uber contributed its own upstream scaling improvements to XGBoost around 2017–2018 [8](#sources).
+Uber contributed its own upstream scaling improvements to XGBoost [8](#sources).
 
 **How it works internally.**
 - *Location:* a particle filter keeps thousands of hypothesized driver locations at once, each
@@ -618,7 +733,8 @@ schemaless.write(
 
 Physically, data is split into a fixed 4,096 shards, each shard is its own MySQL database replicated
 to a master plus two minions spread across multiple datacenters, writes go to the master, and reads
-can come from any replica with asynchronous (typically sub-second) replication lag
+default to the master (so clients see their own writes) but can be configured to hit a minion, which
+lags by asynchronous (typically sub-second) replication
 [2](#sources)[3](#sources). Downstream services can register "triggers" that fire asynchronously
 when a cell changes — effectively an event bus built into the datastore itself [2](#sources).
 Secondary indexes are maintained per-shard and are eventually consistent, usually with under 20ms of
@@ -682,9 +798,9 @@ themselves [4](#sources).
 > much coordination traffic a failure detector needs, without a single control-plane service being a
 > bottleneck or single point of failure.
 
-**What it costs.** Ringpop is explicitly AP, not CP, in CAP-theorem terms: gossip-based membership
-can be briefly stale during churn, which Uber's own real-time platform accepts as a trade-off for
-availability [12](#sources). It's also peer-to-peer by nature, which is part of why Uber later hit a
+**What it costs.** Ringpop is explicitly AP, not CP, in CAP-theorem terms — "trading consistency for
+availability" [12](#sources); in practice that means views (e.g. membership during churn) can be
+briefly stale. It's also peer-to-peer by nature, which is part of why Uber later hit a
 scaling ceiling with it for the *durable*, transactional side of fulfillment and moved that part to
 Google Cloud Spanner instead — Ringpop stayed better suited to fleeting, in-memory state than to
 systems needing strong cross-entity consistency [7](#sources).
@@ -720,12 +836,13 @@ of thousands of candidate polygons down to hundreds) rather than a more "correct
 spatial index like an R-tree [6](#sources). Surge pricing itself is also a break-prevention
 mechanism, not just a business feature: by raising price when local demand outstrips supply, it
 throttles demand and pulls in more supply for exactly the cells that would otherwise be overwhelmed
-[1](#sources).
+[13](#sources).
 
 **A network partition between dispatch and location services.** Because Ringpop-based services are
 explicitly AP rather than CP, a partition doesn't halt the system — nodes keep answering with
 whatever membership and location view they currently have, even if it's briefly stale relative to
-the other side of the partition [12](#sources). The alternative (blocking until the partition heals
+the other side of the partition — an inference from Ringpop being AP [12](#sources); Uber's sources
+don't describe partition behavior directly. The alternative (blocking until the partition heals
 and consistency is guaranteed) would mean the app simply stops working for anyone whose data crosses
 the partition — worse, for a real-time marketplace, than occasionally matching against a driver's
 few-seconds-old position.
@@ -741,10 +858,10 @@ assumes not every first offer will be accepted [12](#sources).
 |---|---|---|
 | Hexagonal grid (H3) instead of squares/postal codes for the geo-index | Uniform neighbor distance simplifies proximity search and avoids postal-code shapes changing arbitrarily [1](#sources) | Can't tile a sphere with only hexagons — 12 pentagon cells are unavoidable and need special-casing [1](#sources) |
 | Batch matching every few seconds instead of instant nearest-driver assignment | Optimizing many requests and drivers together (global optimization) gives better city-wide outcomes than greedy one-at-a-time matches, and lets mid-trip drivers be considered as future candidates [12](#sources) | Adds a small, deliberate delay to each individual match while the batch window fills |
-| Built Schemaless in-house on plain MySQL rather than adopting Cassandra/Riak/MongoDB | None of the evaluated off-the-shelf stores met Uber's linear-scalability + write-availability + trigger needs, and the team had deep MySQL operational experience [2](#sources) | Uber now owns and maintains the sharding, replication, and failover logic itself instead of leaning on a vendor/community |
-| Ringpop embeds sharding + membership inside each service process (via gossip + consistent hashing) instead of a separate coordination service | Lets stateful-feeling behavior (e.g., "who owns this driver's live location") run in memory without an extra network hop to a coordinator [4](#sources) | Trades strict consistency for availability (an AP system) — the membership view can be briefly stale during churn [12](#sources) |
+| Built Schemaless in-house on plain MySQL rather than adopting Cassandra/Riak/MongoDB | None of the evaluated off-the-shelf stores met Uber's linear-scalability + write-availability + trigger needs, and the team lacked confidence it could operate an unfamiliar system at production scale for mission-critical trip data [2](#sources) | Uber now owns and maintains the sharding, replication, and failover logic itself instead of leaning on a vendor/community |
+| Ringpop embeds sharding + membership inside each service process (via gossip + consistent hashing) instead of a separate coordination service | Lets stateful-feeling behavior (e.g., "who owns this driver's live location") run in memory without an extra network hop to a coordinator [4](#sources) | Trades strict consistency for availability (an AP system) — "trading consistency for availability" [12](#sources), so views can be briefly stale |
 | Driver phones used as a backup state store during a datacenter failover | Cheap, always-available place to recover in-flight trip state without waiting on cross-datacenter database replication [12](#sources) | Adds protocol complexity (encrypted state digests pushed to phones) and depends on the driver's phone staying connected |
-| Deep learning (DeepETA) replacing XGBoost for ETA prediction | Training data and model size had outgrown what gradient-boosted trees could scale to; a linear-attention transformer keeps sub-millisecond-scale inference while allowing far bigger models [8](#sources) | Materially more engineering complexity (custom low-latency transformer architecture) than a boosted-tree model |
+| Deep learning (DeepETA) replacing XGBoost for ETA prediction | Training data and model size had outgrown what gradient-boosted trees could scale to; a linear-attention transformer keeps inference within a few milliseconds while allowing far bigger models [8](#sources) | Materially more engineering complexity (custom low-latency transformer architecture) than a boosted-tree model |
 | Geofence lookups served from an in-memory index with read-write locks and atomic index swaps | Needed sub-5ms p95 latency at ~170K QPS — too fast for a database round-trip per request [6](#sources) | The index is only as fresh as the last background rebuild, not strictly real-time |
 | Rebuilding the Fulfillment Platform on Google Cloud Spanner (NewSQL) instead of continuing to scale Cassandra + Redis + Ringpop | The legacy stack's best-effort consistency and peer-to-peer sharding had become a source of engineering debt across 400+ engineers; Spanner gives external consistency and cross-shard transactions the old stack couldn't [7](#sources) | Spanner lacks built-in change-data-capture, so Uber had to build a custom component (LATE) just to get the trigger-like behavior Schemaless offered natively |
 
@@ -785,6 +902,8 @@ assumes not every first offer will be accepted [12](#sources).
 
 ## Glossary
 
+New to these terms? The [concepts](../concepts/README.md) folder explains the core ideas in depth.
+
 - **Marketplace (in Uber's sense):** the collection of backend services that match real-world supply
   (drivers) to real-world demand (riders) and handle pricing — the economic engine behind the app,
   not a literal storefront.
@@ -800,7 +919,7 @@ assumes not every first offer will be accepted [12](#sources).
 - **Hungarian algorithm:** a classic algorithm for solving an "assignment problem" — pairing up two
   groups (like riders and drivers) so the total cost (like total wait time) is as low as possible.
   Named for its origins in Hungarian mathematicians' work; not confirmed as what Uber actually uses.
-- **Geospatial index:** a way of organizing location data so "what's near this point" can be
+- **[Geospatial index](../concepts/geo-indexing.md):** a way of organizing location data so "what's near this point" can be
   answered quickly instead of comparing every possible pair of coordinates.
 - **H3:** Uber's open-source system for dividing the Earth's surface into hexagonal cells at
   multiple zoom levels, so any GPS point can be converted into a compact ID and compared cheaply to
@@ -823,12 +942,12 @@ assumes not every first offer will be accepted [12](#sources).
 - **Cell (Schemaless sense):** the smallest unit of data in Schemaless — an immutable JSON blob
   identified by a row key, column name, and version ("ref key"); a different meaning of "cell" than
   an H3 hexagon [2](#sources)[3](#sources).
-- **Sharding:** splitting one big database (or index) into smaller pieces by some key (like a hash
+- **[Sharding](../concepts/sharding.md):** splitting one big database (or index) into smaller pieces by some key (like a hash
   of a row ID) so each machine only has to hold and serve part of the data.
-- **Master/minion replicas:** one copy of a shard designated the "master" that takes writes, with
+- **[Master/minion replicas](../concepts/replication.md):** one copy of a shard designated the "master" that takes writes, with
   other copies ("minions") that replicate from it and can serve reads — a common pattern for scaling
   reads and surviving a single machine's failure.
-- **Consistent hashing:** a way of assigning keys (or work) to machines using a hash so that when a
+- **[Consistent hashing](../concepts/consistent-hashing.md):** a way of assigning keys (or work) to machines using a hash so that when a
   machine is added or removed, only a small fraction of keys need to move, instead of reshuffling
   everything.
 - **Gossip protocol (SWIM):** a way for machines in a cluster to spread "who's alive/who's dead"
@@ -844,20 +963,20 @@ assumes not every first offer will be accepted [12](#sources).
   built-in request tracing [12](#sources).
 - **Hyperbahn:** Uber's service-discovery layer (how one microservice finds the network address of
   another) built to work with TChannel [9](#sources).
-- **AP vs. CP (from the CAP theorem):** a distributed system facing a network split has to choose
+- **[AP vs. CP (from the CAP theorem)](../concepts/cap-and-consistency.md):** a distributed system facing a network split has to choose
   between staying **A**vailable (keep answering, possibly with stale data) or staying **C**onsistent
   (only answer with guaranteed up-to-date data, even if that means refusing some requests).
   Ringpop-based services lean AP [12](#sources).
-- **Kafka:** a distributed log/message queue — a durable, ordered stream that many producers can
+- **[Kafka](../concepts/message-queues-and-logs.md):** a distributed log/message queue — a durable, ordered stream that many producers can
   write events to and many consumers can read from, used here to move location pings and trip events
   between services [9](#sources).
 - **API gateway / edge layer:** the front door of the backend — terminates encrypted connections,
   authenticates the request, and routes it into the right internal service, so mobile apps don't
   talk to hundreds of services directly [10](#sources).
-- **NGINX / HAProxy:** widely used web server and load-balancer software; here NGINX handles
+- **[NGINX / HAProxy](../concepts/load-balancing.md):** widely used web server and load-balancer software; here NGINX handles
   TLS/auth at the edge and HAProxy spreads incoming requests across backend instances
   [10](#sources).
-- **Microservices vs. monolith:** a monolith is one large program doing everything; microservices
+- **[Microservices](../concepts/microservices.md) vs. monolith:** a monolith is one large program doing everything; microservices
   split that into many small, independently deployable services that talk to each other over the
   network. Uber moved from the former to the latter as it grew [9](#sources).
 - **ETA (estimated time of arrival):** how long until a driver reaches the pickup point, or a trip
@@ -913,7 +1032,7 @@ assumes not every first offer will be accepted [12](#sources).
   objects/structs instead of writing raw SQL, translating between the two.
 - **Circuit breaker:** a pattern where, after enough failures talking to a dependency, a service
   temporarily stops trying (and fails fast or falls back) instead of repeatedly hammering something
-  that's already down [2](#sources).
+  that's already down [3](#sources).
 - **Read-write lock:** a synchronization mechanism that lets many readers access data at once, but
   blocks everyone while a writer is updating it — used so an in-memory index can be queried
   concurrently while still being safely refreshed [6](#sources).

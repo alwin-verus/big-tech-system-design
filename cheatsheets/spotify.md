@@ -4,7 +4,7 @@
 
 ## In 60 seconds
 
-Spotify streams pre-encoded, chunked audio from CDN edge caches (standardized on Fastly in 2020), so a phone on bad mobile data still starts playback fast. Behind that sits thousands of independent microservices owned by autonomous "squads," cataloged through **Backstage** — an internal developer portal Spotify built after engineers could no longer find who owned what, later donated to the CNCF. Every user action (play, skip, search) becomes an event pushed through a cloud pipeline — self-hosted Kafka until 2017, then Google Cloud Pub/Sub and Dataflow — feeding data warehouses and ML feature stores. **Discover Weekly** blends three independently trained models (collaborative filtering, NLP, and an audio CNN) into one playlist per user, recomputed every Monday. All of it runs on Google Cloud Platform, which Spotify moved onto entirely between 2016 and 2018 rather than keep running its own data centers.
+Spotify streams audio in fixed bitrate tiers from CDN edge caches (Fastly plus Akamai/AWS for audio; other content standardized on Fastly in 2020), so a phone on bad mobile data still starts playback fast. Behind that sits thousands of independent microservices owned by autonomous "squads," cataloged through **Backstage** — an internal developer portal Spotify built after engineers could no longer find who owned what, later donated to the CNCF. Every user action (play, skip, search) becomes an event pushed through a cloud pipeline — self-hosted Kafka until 2017, then Google Cloud Pub/Sub and Dataflow — feeding data warehouses and ML feature stores. **Discover Weekly** combines three kinds of signal (other listeners' playlists and logs, web text about music, and audio spectrograms) into one playlist per user, recomputed every Monday. All of it runs on Google Cloud Platform, which Spotify moved onto entirely between 2016 and 2018 rather than keep running its own data centers.
 
 ## The picture
 
@@ -30,17 +30,17 @@ flowchart LR
 | Premium subscribers | 300M (Q2 2026) | [Spotify Form 6-K, Q2 2026](https://www.sec.gov/Archives/edgar/data/0001639920/000162828026052543/spot-20260630x6xk.htm) |
 | Event delivery throughput, GCP era | ~8M events/sec peak, 500B+ events/day | [Spotify's Event Delivery – Life in the Cloud](https://engineering.atspotify.com/2019/11/spotifys-event-delivery-life-in-the-cloud) |
 | Distinct event types on the pipeline | 500-600+ | [Changing the Wheels on a Moving Bus](https://engineering.atspotify.com/2021/10/changing-the-wheels-on-a-moving-bus-spotify-event-delivery-migration) |
-| Onboarding time reduction from Backstage | ~55% decrease | [How We Use Backstage at Spotify](https://engineering.atspotify.com/2020/04/how-we-use-backstage-at-spotify) |
+| Onboarding time reduction from Backstage | Cut in half | [How We Use Backstage at Spotify](https://engineering.atspotify.com/2020/04/how-we-use-backstage-at-spotify) |
 | Services/data moved to GCP | 2,000+ services, 100+ PB stored data | [Views From The Cloud, Part 1](https://engineering.atspotify.com/2019/12/views-from-the-cloud-a-history-of-spotifys-journey-to-the-cloud-part-1-2) |
 | Discover Weekly early adoption | ~100M active users at launch (2015), ~40M dedicated listeners within a year | [The Little Hack That Could — IEEE Spectrum](https://spectrum.ieee.org/amp/the-little-hack-that-could-the-story-of-spotifys-discover-weekly-recommendation-engine-2650274671) |
 | CDN squad adoption | 60+ squads, 80+ services routed through Fastly (Feb 2020) | [How Spotify Aligned CDN Services](https://engineering.atspotify.com/2020/02/how-spotify-aligned-cdn-services-for-a-lightning-fast-streaming-experience) |
 
 ## Signature ideas
 
-- **Pre-encode + chunk audio at ingest, cache at CDN edge** — makes range requests and adaptive bitrate simple; solves fast playback start on any network.
+- **Pre-encode audio into fixed tiers, cache at CDN edge (chunking is a reference design)** — makes range requests and adaptive bitrate simple; solves fast playback start on any network.
 - **Backstage service catalog** — solves "who owns this" once you're past thousands of services and hundreds of autonomous teams.
 - **Per-event-type isolated pipelines ("liveness over lateness")** — one broken event type can't block delivery of the other 500+.
-- **Three-model recommendation blend (CF + NLP + audio CNN)** — covers collaborative filtering's blind spot for brand-new, low-play tracks.
+- **Three-signal recommendation blend (CF + text + audio; the model-level split isn't in the cited source)** — covers collaborative filtering's blind spot for brand-new, low-play tracks.
 - **Squads/tribes/chapters/guilds org model** — matches org structure to independently-owned microservices so "who owns this" has one answer.
 - **Lift-and-shift GCP migration** — moved services as-is, let data pipelines rewrite freely, to avoid destabilizing live streaming mid-migration.
 

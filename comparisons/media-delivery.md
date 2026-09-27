@@ -38,14 +38,14 @@ hardware, or physical boxes in other companies' networks.
 
 | Dimension | Netflix | YouTube | Spotify | Instagram |
 |---|---|---|---|---|
-| Content source | Finite, licensed and produced catalog | Creators upload 500+ hours of video every minute (2020) | Licensed audio catalog | User photos and videos |
-| Encoding approach | Per-title (2015), then per-shot "Dynamic Optimizer" (2020), tuned against Netflix's VMAF quality metric | Fan-out into a dozen-plus resolution/codec renditions, H.264 plus VP9 plus AV1 | Pre-encoded at ingest into fixed tiers: Ogg Vorbis 24/96/160/320 kbps, FLAC lossless, AAC for web | Multiple resolutions produced by async workers after upload |
+| Content source | Finite, licensed and produced catalog | Creators upload 500+ hours of video every minute (2021) | Licensed audio catalog | User photos and videos |
+| Encoding approach | Per-title (2015), then per-shot "Dynamic Optimizer" (2018), tuned against Netflix's VMAF quality metric | Fan-out into a dozen-plus resolution/codec renditions, H.264 plus VP9 plus AV1 | Pre-encoded into fixed tiers: 24/96/160/320 kbps (codec not stated), FLAC lossless, AAC for web | Not publicly detailed (multi-resolution output by async workers is unverified) |
 | Encoding hardware | Parallel cloud encoding | Google's custom Argos VCU chips, 20-33x more compute-efficient than the prior CPU pipeline | Not described | ~200 Python workers on a Gearman task queue (2012) |
 | Origin storage | S3 | Colossus, Google's cluster file system | Object storage | S3 until 2014, then Facebook's own data centers (internals not public) |
 | CDN | Open Connect: Netflix-owned boxes inside ISPs, 8,000+ appliances | Google Global Cache inside ISPs in 1,300+ cities, plus peering PoPs | Fastly, standardized in 2020 after years of mixed vendors | CloudFront originally; later setup not publicly detailed |
-| How the CDN gets content | Pushed overnight, before anyone asks (proactive fill) | Pulled up a tier on a cache miss | Pulled from origin on a cache miss | Not described |
-| Who picks quality | The client, per segment | The client, per segment, via DASH | The client, per chunk, via HTTP range requests | Not described beyond multiple resolutions |
-| Headline number | ~15% of global downstream internet traffic (2023) | 500+ hours uploaded per minute | 777M monthly users (Q2 2026) | 20 billion+ photos moved off AWS in 2014 |
+| How the CDN gets content | Pushed before anyone asks (proactive fill; overnight timing unverified) | Pulled up a tier on a cache miss | Pulled from origin on a cache miss | Not described |
+| Who picks quality | The client, per segment | The client, per segment, via DASH | Not described (per-chunk range requests is a reference design) | Not described beyond multiple resolutions |
+| Headline number | ~15% of global internet traffic (2022 data) | 500+ hours uploaded per minute | 777M monthly users (Q2 2026) | 20 billion+ photos moved off AWS in 2014 |
 
 ## Dimension 1: ingest
 
@@ -76,9 +76,9 @@ rather than done inline, so the upload returns fast and a transcoder crash never
 fan-out](../companies/youtube.md#upload-ingestion-and-the-transcode-fan-out)).
 
 **Instagram** follows the same idea with older tools. The upload request does exactly two things,
-store the original bytes and enqueue a job, and returns. Workers make the resized versions
-afterward. For a short window after upload, not every resolution exists yet, a deliberate trade of a
-small delay for a fast response (see [Instagram: media storage and
+store the original bytes and enqueue a job, and returns. Workers do the slow follow-up work
+(cross-posting, notifications, fan-out) afterward, a deliberate trade of a small delay for a fast
+response; whether they also generate resized versions is not stated in Instagram's post (unverified) (see [Instagram: media storage and
 delivery](../companies/instagram.md#media-storage-and-delivery)).
 
 **Netflix** has no upload problem, because a few studios deliver masters rather than millions of
@@ -87,8 +87,8 @@ continuous camera take; each cut starts a new one) so each can be encoded on its
 per-title and shot-based
 encoding](../companies/netflix.md#signature-component-1-per-title-and-shot-based-encoding)).
 
-**Spotify** pre-encodes each track into its bitrate tiers and chunks it at ingest time, so the CDN
-can cache and serve pieces (see [Spotify: CDN and audio
+**Spotify** offers each track in fixed bitrate tiers; chunking at ingest so the CDN can cache and
+serve pieces is a reference design, not described in its sources (see [Spotify: CDN and audio
 delivery](../companies/spotify.md#cdn-and-audio-delivery-getting-bytes-to-a-phone-in-under-a-second)).
 
 Shared pattern: **write the original durably, then do the slow work from a queue.** The upload path
@@ -105,7 +105,7 @@ Netflix's 2015 **per-title encoding** built a ladder per title and reported abou
 bitrate savings at the same quality. The **Dynamic Optimizer** went further, per shot: for each shot
 it tries many bitrate and resolution combinations and keeps the **convex hull**, the set of options
 giving the best quality for each bitrate. A one-hour episode with 4-second shots is roughly 900
-shots, each optimized separately, which is why the 2020 production rollout was mainly a
+shots, each optimized separately, which is why the 2018 production rollout was mainly a
 job-scheduling problem (see [Netflix: per-title and shot-based
 encoding](../companies/netflix.md#per-title-and-shot-based-dynamic-optimizer-encoding)).
 
@@ -121,8 +121,8 @@ flowchart LR
 **YouTube spends on hardware, because the volume is unbounded.** 500+ hours uploaded per minute is
 about 720,000 hours of new footage per day (the page's own arithmetic). Each upload fans out into
 many independent tasks, one per resolution and codec pair, so a slow 4K/AV1 task never blocks the
-144p/H.264 one. Codecs are chosen by value: cheap H.264 for everything and broad device support; VP9
-at roughly 40-45% lower bitrate but about 5x the encode compute; AV1 lower still, saved for
+144p/H.264 one. Codecs are chosen by value (the per-codec split is unverified): cheap H.264 for everything and broad device support; VP9
+at lower bitrate but about 5x the encode compute; AV1 lower still, saved for
 higher-value content. To afford this, Google built the **Argos VCU**, an **ASIC** (a chip made for
 one job) with 10 encoder cores per chip, 20 chips per server, reporting 20-33x better compute
 efficiency than its prior software pipeline (see [YouTube: upload ingestion and the transcode
@@ -136,8 +136,8 @@ tiers covers every network: Low ~24 kbps, Normal ~96 kbps, High ~160 kbps, Very 
 several times (see [Spotify: CDN and audio
 delivery](../companies/spotify.md#cdn-and-audio-delivery-getting-bytes-to-a-phone-in-under-a-second)).
 
-**Instagram** makes multiple resolutions per upload for different device sizes and connections, via
-async workers. Its page does not detail codec choices.
+**Instagram** is often described as making multiple resolutions per upload via async workers, but its
+cited source does not say so (unverified). Its page does not detail codec choices.
 
 | | Netflix | YouTube | Spotify | Instagram |
 |---|---|---|---|---|
@@ -170,9 +170,9 @@ flowchart TB
 **Netflix Open Connect pushes content before it is asked for.** Netflix designs its own **Open
 Connect Appliances** (OCAs) and ships them for free to ISPs to rack in their own networks. Because
 Netflix's catalog is finite and regional taste is predictable, it forecasts what each ISP's members
-will watch and pushes that content during a nightly off-peak **fill window**. At peak hours the box
+will watch and pushes that content ahead of demand (a nightly off-peak **fill window**; the timing is unverified). At peak hours the box
 already holds almost everything it will be asked for. When a miss happens, Netflix classifies why
-(title too new, box too new, or an unforecast spike) so the placement logic improves (see [Netflix:
+(content not at the nearest site, or the nearby boxes too loaded) so the placement logic improves (see [Netflix:
 Open Connect](../companies/netflix.md#open-connect-placement-fill-and-steering)).
 
 Open Connect numbers: 8,000+ appliances, 1,000+ ISP partners, and about 95% of traffic delivered
@@ -188,11 +188,11 @@ shrinking fraction reaches the next, which stops a viral video from stampeding o
 **thundering herd**) (see [YouTube: CDN and edge
 delivery](../companies/youtube.md#cdn-and-edge-delivery-google-global-cache-and-peering)).
 
-**Spotify rents, and standardized.** For years different Spotify teams picked their own CDN setup
-(Akamai, AWS, or exposing storage buckets directly). Nobody could see the whole request path. In
-2020 Spotify consolidated onto Fastly and built **SquadCDN**, a self-service tool with deployment
+**Spotify rents, and standardized.** Audio ran on a multi-CDN setup (Akamai and AWS, plus Fastly)
+that worked well, but other content had fragmented, some served straight from storage buckets.
+Nobody could see the whole request path. In 2020 Spotify consolidated that onto Fastly and built **SquadCDN**, a self-service tool with deployment
 reviews and central 24/7 monitoring; by February 2020, 80+ services and 60+ teams were onboarded.
-Pre-chunked audio means the CDN caches small pieces and serves HTTP **range requests** (asking for
+In a reference design (unverified), pre-chunked audio means the CDN caches small pieces and serves HTTP **range requests** (asking for
 bytes 1,000,000 to 2,000,000 instead of the whole file) (see [Spotify: CDN and audio
 delivery](../companies/spotify.md#cdn-and-audio-delivery-getting-bytes-to-a-phone-in-under-a-second)).
 

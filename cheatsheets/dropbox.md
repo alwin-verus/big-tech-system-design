@@ -26,7 +26,7 @@ flowchart LR
 |---|---|---|
 | Magic Pocket storage drives (2023) | 600,000+ | [Magic Pocket: Dropbox's Exabyte-Scale Blob Storage System — QCon Plus](https://www.infoq.com/presentations/magic-pocket-dropbox) |
 | Magic Pocket annual durability (2023) | over 12 nines | [Magic Pocket: Dropbox's Exabyte-Scale Blob Storage System — QCon Plus](https://www.infoq.com/presentations/magic-pocket-dropbox) |
-| Magic Pocket theoretical durability target | "27 nines" | [Pocket Watch: Verifying exabytes of data](https://dropbox.tech/infrastructure/pocket-watch) |
+| Magic Pocket theoretical durability (Markov-model estimate) | "27 nines" | [Pocket Watch: Verifying exabytes of data](https://dropbox.tech/infrastructure/pocket-watch) |
 | Edgestore total throughput (2018) | ~10 million requests/sec | [Cross shard transactions at 10 million requests per second](https://dropbox.tech/infrastructure/cross-shard-transactions-at-10-million-requests-per-second) |
 | Content-hash block size | 4MB (4,194,304 bytes) | [Content Hash technical reference — Dropbox API docs](https://docs.dropboxapi.com/dropbox-api/docs/technical-reference/content-hash) |
 | Nucleus rewrite duration | ~4-year project (2016 to March 2020) | [Rewriting the heart of our sync engine](https://dropbox.tech/infrastructure/rewriting-the-heart-of-our-sync-engine) |
@@ -65,5 +65,5 @@ flowchart LR
 
 - The metadata ER diagram in companies/dropbox.md collapses two real, separate systems (a dedicated Filesystem service and the more generic Edgestore) into one simplified schema — don't cite it as Dropbox's literal table layout.
 - Dropbox's blocks are fixed-size, not content-defined chunks — nothing in their public engineering blog indicates they've adopted content-defined chunking.
-- "27 nines" is a theoretical verification-design target from 2016, not a currently-claimed durability figure — the 2023 QCon talk cites "over 12 nines" as the actual annual durability number.
+- "27 nines" is a 2016 Markov-model durability estimate, not a currently-claimed durability figure — the 2023 QCon talk cites "over 12 nines" as the actual annual durability number.
 - Magic Pocket's "bucket"/"volume" terminology has nothing to do with an S3 bucket — it's Dropbox's own aggregation unit (1-2GB of blocks).

@@ -1,6 +1,6 @@
 # Slack: how a message reaches every device on your team in half a second
 
-> **In 60 seconds:** Slack splits its real-time layer into two kinds of stateful server: Channel Servers, which hold the source of truth and recent history for a slice of channels, and Gateway Servers, deployed close to users at the network edge, which hold each connected client's WebSocket and the list of channels it cares about.
+> **In 60 seconds:** Slack splits its real-time layer into two kinds of stateful server: Channel Servers, which own a slice of channels and hold their recent history in memory, and Gateway Servers, deployed close to users at the network edge, which hold each connected client's WebSocket and the list of channels it cares about.
 >
 > A posted message flows client → Webapp → Admin Server → the right Channel Server (found via consistent hashing) → out to every Gateway Server subscribed to that channel → down each one's open WebSockets to clients, landing worldwide within about 500 milliseconds.
 >
@@ -17,6 +17,7 @@
 - [Before you read: design it yourself](#before-you-read-design-it-yourself)
 - [The problem](#the-problem)
 - [Scale](#scale)
+- [Back-of-the-envelope math](#back-of-the-envelope-math)
 - [Requirements](#requirements)
 - [How it evolved](#how-it-evolved)
 - [High-level design](#high-level-design)
@@ -62,7 +63,7 @@ Think about splitting "who owns this channel's data" from "who owns this specifi
 <details>
 <summary>How Slack does it</summary>
 
-Channel Servers (stateful, central, own a slice of channels via consistent hashing) hold the source of truth; Gateway Servers (stateful, deployed at the edge near users) hold each client's WebSocket and subscriptions. A Channel Server only ever talks to Gateway Servers, never individual sockets, so adding more edge capacity for connections doesn't require the storage tier to know or care how many sockets exist behind it — the two scale independently.
+Channel Servers (stateful, central, own a slice of channels via consistent hashing) hold channel state and recent history; Gateway Servers (stateful, deployed at the edge near users) hold each client's WebSocket and subscriptions. A Channel Server only ever talks to Gateway Servers, never individual sockets, so adding more edge capacity for connections doesn't require the storage tier to know or care how many sockets exist behind it — the two scale independently.
 
 Deep dive: [Channel Servers and Gateway Servers](#channel-servers-and-gateway-servers-separating-storage-of-truth-from-the-edge).
 
@@ -80,7 +81,7 @@ Think about what finer-grained key you could reshard by instead of the whole wor
 <details>
 <summary>How Slack does it</summary>
 
-A ~3-year migration onto Vitess (built at YouTube) let Slack reshard by something more flexible than workspace — messages, for instance, by channel ID — so one giant workspace's load spreads across many shards instead of being stuck on one. Slack deliberately rejected NoSQL/NewSQL alternatives to keep MySQL's operational familiarity, and the payoff showed up directly in March 2020, when a 50%-in-one-week pandemic traffic spike let Vitess split an overloaded shard live with zero customer-visible downtime.
+A ~3-year migration onto Vitess (built at YouTube) let Slack reshard by something more flexible than workspace — messages, for instance, by channel ID — so one giant workspace's load spreads across many shards instead of being stuck on one. Slack deliberately rejected NoSQL/NewSQL alternatives to keep MySQL's operational familiarity, and the payoff showed up directly in March 2020, when a 50%-in-one-week pandemic query spike was absorbed by horizontally splitting one of the busiest keyspaces with Vitess's splitting workflows — without which, Slack says, it would have faced downtime for its largest customers.
 
 Deep dive: [The Vitess migration](#the-vitess-migration-from-one-shard-per-workspace-to-flexible-resharding).
 
@@ -98,7 +99,7 @@ Think about how few channels should have to move when one server disappears from
 <details>
 <summary>How Slack does it</summary>
 
-Consistent hashing means losing a Channel Server only reassigns the slice of channels it owned; CHARM (Slack's ring manager) detects the unhealthy host and gets a replacement serving traffic in under 20 seconds via Consul. That doesn't help when the failure is one layer down: on January 4, 2021, a saturated AWS Transit Gateway caused a 5-hour global outage where autoscaling misread "network-starved, so CPU looks idle" as "safe to remove capacity," actively shutting down healthy web servers during the incident — a reminder to check what your control systems assume about the layer underneath them.
+Consistent hashing means losing a Channel Server only reassigns the slice of channels it owned; CHARM (Slack's ring manager) detects the unhealthy host and gets a replacement serving traffic in under 20 seconds via Consul. That doesn't help when the failure is one layer down: on January 4, 2021, a saturated AWS Transit Gateway caused a multi-hour global outage where autoscaling misread "network-starved, so CPU looks idle" as "safe to remove capacity," actively shutting down healthy web servers during the incident — a reminder to check what your control systems assume about the layer underneath them.
 
 Deep dive: [Consistent hashing and CHARM](#consistent-hashing-and-charm-turning-a-stateful-server-crash-into-a-non-event) and [What happens when things break](#what-happens-when-things-break).
 
@@ -106,7 +107,7 @@ Deep dive: [Consistent hashing and CHARM](#consistent-hashing-and-charm-turning-
 
 ## The problem
 
-It's 9:00 AM on a Monday at a company with 160,000 Slack users in one workspace — a real scale Slack has documented for its largest customers [8].
+It's 9:00 AM on a Monday at a company with 160,000 active Slack users — a real scale Slack has documented for its largest customers [8].
 
 Laptops all over the world wake up from the weekend within the same few minutes. Every one of them tries to reconnect to Slack at once, and every one of them has a stale local cache of "who's in this workspace, what channels exist, who's online."
 
@@ -127,7 +128,7 @@ This page tries to answer three questions a junior engineer should walk away abl
 | Peak Vitess query load | 2.3 million QPS (2 million reads + 300,000 writes) | [2] |
 | Vitess median / p99 latency | 2ms / 11ms | [2] |
 | Share of MySQL traffic on Vitess | 99% (Dec 2020) | [2] |
-| Vitess migration duration | ~3 years, starting Fall 2016 | [2] |
+| Vitess migration duration | ~3 years, starting 2017 (problems scoped fall 2016) | [2] |
 | Job queue volume | 1.4 billion jobs/day, peak 33,000 jobs/sec | [4] |
 | Kafka cluster (job queue) | 16 brokers, 32 partitions/topic, replication factor 3, 2-day retention | [4] |
 | Flannel peak connections | 4 million simultaneous | [3] |
@@ -136,9 +137,9 @@ This page tries to answer three questions a junior engineer should walk away abl
 | Channels served per Channel Server host, at peak | ~16 million | [1] |
 | Channel Server failover time | new CS ready to serve in under 20 seconds | [1] |
 | Global message delivery latency | worldwide delivery within 500ms | [1] |
-| Largest documented single workspace (shared channels) | 160,000 active users, 5,000+ shared channels (2019) | [8] |
-| Search relevance improvement (2017 re-ranking rollout) | +9% clicked searches, +27% position-1 clicks, 50% of users | [6] |
-| January 4, 2021 outage duration | ~5 hours (6:57 AM–~10:40 AM PT) | [7] |
+| Largest documented customers (shared channels) | 160,000+ active users, 5,000+ shared channels (2019) | [8] |
+| Search relevance improvement (Nov 2016 re-ranking rollout) | +9% clicked searches, +27% position-1 clicks, 50% of users | [6] |
+| January 4, 2021 outage duration | ~4 hours (errors by 6:57 AM PST; network normal 10:40 AM PST) | [7] |
 | Message success rate during Jan 2021 outage | ~99% vs. a normal >99.999% | [7] |
 | Servers Slack attempted to add during the outage | 1,200 | [7] |
 | Query-rate spike, March 2020 pandemic surge | +50% in one week | [2] |
@@ -158,7 +159,120 @@ What these numbers mean in practice:
 
 - The gap between "99.999% success rate" (normal) and "99%" (during the January 2021 outage) sounds small as a percentage.
 
-  But at Slack's traffic volume it represents a five-hour, worldwide, front-page incident — a reminder that "the success rate barely moved" and "this was a severe outage" can both be true statements about the same event.
+  But at Slack's traffic volume it represents a multi-hour, worldwide, front-page incident — a reminder that "the success rate barely moved" and "this was a severe outage" can both be true statements about the same event.
+
+## Back-of-the-envelope math
+
+Back-of-the-envelope math is the rough, order-of-magnitude estimating engineers do on a whiteboard — no calculator, no precise data, just enough arithmetic to check whether a design idea is remotely plausible before building it. Inputs marked **[n]** come straight from this page's [Scale](#scale) table and cite the same source; everything else is a labeled **Assumption**, not a fact.
+
+### Estimate 1: What's the peak-to-average ratio for the job queue?
+
+**Question:** Slack's job queue processes 1.4 billion jobs/day with a documented peak of 33,000 jobs/sec. How does that peak compare to the average rate, and does it fit the usual "peak ~2-3x average" rule of thumb?
+
+**Inputs:**
+- Job queue volume: 1.4 billion jobs/day, peak 33,000 jobs/sec [4]
+- Rule of thumb: 1 day ≈ 86,400 s.
+
+**Math:**
+```text
+average jobs/sec = 1,400,000,000 / 86,400
+                  ≈ 16,204/sec
+
+peak / average    = 33,000 / 16,204
+                  ≈ 2.04x
+```
+
+**Answer:** ~16,200 jobs/sec average; peak is about 2x average.
+
+**What it tells you:** a ~2x peak-to-average ratio is right in the ordinary range — it's why the Kafka-backed buffer in front of Redis (see [The job queue](#the-job-queue-from-a-redis-outage-to-a-kafka-backed-pipeline)) only needs to absorb roughly double the average load, not an order of magnitude more, to keep up.
+
+### Estimate 2: How often does each Flannel connection actually query it?
+
+**Question:** Flannel serves 4 million simultaneous connections at a peak query rate of 600,000 queries/sec. On average, how often does each connection query it?
+
+**Inputs:**
+- Flannel peak connections: 4 million simultaneous [3]
+- Flannel peak query rate: 600,000 client queries/sec [3]
+
+**Math:**
+```text
+queries per connection per second = 600,000 / 4,000,000
+                                   = 0.15/sec
+                                   ≈ 1 query every ~6.7 s
+```
+
+**Answer:** ~0.15 queries/sec per connection (about one every 7 seconds).
+
+**What it tells you:** confirms Flannel's job is serving a light, bursty trickle of lookups per client — consistent with it being an edge cache doing opportunistic prefetching, not a service under continuous per-client polling; see [Flannel: solving the reconnect storm before it starts](#flannel-solving-the-reconnect-storm-before-it-starts).
+
+### Estimate 3: What fraction of Slack's peak database load is writes?
+
+**Question:** Given 2.3 million peak Vitess QPS split into 2 million reads and 300,000 writes, what's the write share and the read:write ratio?
+
+**Inputs:**
+- Peak Vitess query load: 2.3 million QPS (2 million reads + 300,000 writes) [2]
+
+**Math:**
+```text
+write share    = 300,000 / 2,300,000 ≈ 0.130 → ~13%
+read:write     = 2,000,000 : 300,000 ≈ 6.7 : 1
+```
+
+**Answer:** ~13% writes; roughly 6.7 reads for every write.
+
+**What it tells you:** a strongly read-heavy workload like this is exactly why [the Vitess migration](#the-vitess-migration-from-one-shard-per-workspace-to-flexible-resharding) — and Vitess's read/replica-serving design generally — matters as much as write-side resharding.
+
+### Estimate 4: How much would 2 days of peak job volume cost to buffer in Kafka?
+
+**Question:** Slack's job-queue Kafka retains data for 2 days. Roughly how much storage would that be at the documented peak rate?
+
+**Inputs:**
+- Kafka retention: 2-day [4]
+- Peak jobs/sec: 33,000 [4]
+- Replication factor: 3 [4]
+- Assumption: an average job's payload (references/metadata, not full message bodies) is about 1KB.
+
+**Math:**
+```text
+jobs in 2 days at peak = 33,000/s × 86,400 s/day × 2 days
+                        = 33,000 × 172,800
+                        = 5,702,400,000 ≈ 5.7 billion jobs
+
+raw storage   = 5.7 billion jobs × 1 KB/job ≈ 5.7 TB
+replicated    = 5.7 TB × 3 ≈ 17 TB
+```
+
+**Answer:** ~5.7 billion jobs / ~5.7TB raw (~17TB replicated) if sustained at peak for the full 2-day retention window.
+
+**What it tells you:** replication (factor 3) roughly triples the storage cost of that safety margin — a concrete reason Kafka here is treated as a short-term durable buffer (2-day retention), not a permanent archive; see [The job queue](#the-job-queue-from-a-redis-outage-to-a-kafka-backed-pipeline).
+
+### Estimate 5: How many background jobs does one daily active user generate?
+
+**Question:** On average, how many background jobs does Slack process per daily active user?
+
+**Inputs:**
+- Job queue volume: 1.4 billion jobs/day [4]
+- Daily active users: ~42 million (2024, estimate) [14] *(third-party, unconfirmed)*
+
+**Math:**
+```text
+jobs per DAU per day = 1,400,000,000 / 42,000,000
+                      ≈ 33.3
+```
+
+**Answer:** ~33 jobs per daily active user per day.
+
+**What it tells you:** a single user's ordinary daily activity (a handful of messages, reactions, mentions) fans out into dozens of background jobs — quantifying why job-queue durability is "a real product defect, not a cosmetic one" as the [Requirements](#requirements) section states.
+
+### Rules of thumb used
+
+| Rule | Value |
+|---|---|
+| 1 day | ~86,400 s ~ 10^5 s |
+| 1 KB | ~10^3 bytes |
+| Peak vs. average load | typically ~2-3x |
+
+These are general estimating conventions, not Slack-specific facts.
 
 ## Requirements
 
@@ -186,14 +300,14 @@ timeline
   2009 : Tiny Speck founded to build the game Glitch
   2012 : Glitch shut down after years of development
   2013 : Slack launches, MySQL sharded by workspace id from the start
-  2016 : Fall, Vitess migration begins to fix workspace level sharding limits
-  2017 : Real time messaging architecture documented, Channel and Gateway servers
+  2017 : Vitess migration begins to fix workspace level sharding limits
   2017 : Flannel edge cache ships to fix reconnect storms for large teams
-  2017 : Search at Slack ships, Solr plus machine learned re-ranking
-  2017 : Job queue rebuilt on Kafka after a Redis only outage near miss
-  2019 : Shared Channels ship, connecting two organizations workspaces
+  2017 : Search at Slack write up, Solr plus machine learned re-ranking
+  2017 : Job queue rebuilt on Kafka after a Redis only job queue outage
+  2019 : Shared Channels architecture written up, connecting two organizations workspaces
   2020 : December, Vitess carries 99 percent of MySQL traffic at 2.3 million QPS
-  2021 : January 4th, five hour global outage from AWS Transit Gateway saturation
+  2021 : January 4th, multi hour global outage from AWS Transit Gateway saturation
+  2023 : Real time messaging architecture documented, Channel and Gateway servers
   2022 : October, a bulk user removal job overloads Vitess shards
   2024 : March, Unified Grid rollout completed, org wide data model
 ```
@@ -212,19 +326,17 @@ Slack launched in 2013, built on the bones of that internal communication tool. 
 
 A structural problem was showing: the busiest hosts — holding the largest customers — had to handle all of those customers' traffic on fixed hardware, while thousands of other hosts sat comparatively idle [2]. Sharding by workspace meant a workspace could not itself be split across multiple shards, no matter how big it got.
 
-**2017 — the real-time and edge layers get documented, and search ships.** This is the year Slack's now-classic architecture — Channel Servers, Gateway Servers, Admin Servers, Presence Servers, all coordinated by consistent hashing — was written up in detail [1].
+**2017 — the edge layer and search re-ranking get documented.** Flannel shipped (running at the edge since January 2017) to solve reconnect storms for large teams [3], and Slack wrote up its Solr-based search with a machine-learned re-ranker rolled out in November 2016 [6]. (The Channel Server / Gateway Server real-time architecture was written up later, in April 2023 [1].)
 
-The same year, Flannel shipped to solve reconnect storms for large teams [3], and the first version of Slack's search system launched on Apache Solr with machine-learned re-ranking [6].
-
-Behind the scenes, the job queue was also rebuilt this era: a purely Redis-based queue had come within a bad incident of an outage roughly a year earlier, when enqueue rates outpaced dequeue rates and Redis ran out of memory. The fix layered Kafka in front of Redis for durability [4].
+Behind the scenes, the job queue was also rebuilt this era: roughly a year earlier, a purely Redis-based queue had caused a significant production outage — database contention slowed job execution, Redis hit its memory limit, and new jobs could no longer be enqueued. The fix layered Kafka in front of Redis for durability [4].
 
 **2019 — Shared Channels.** Connecting two different companies' workspaces broke Slack's founding assumption that a workspace is the atomic unit of data partitioning, and required a genuinely new cross-workspace data model rather than an extension of the existing one [8].
 
-**2020 — Vitess finishes the job it started in 2016.** By December 2020, 99% of Slack's MySQL traffic ran through Vitess, peaking at 2.3 million queries per second [2].
+**2020 — Vitess finishes the job it started in 2017.** By December 2020, 99% of Slack's MySQL traffic ran through Vitess, peaking at 2.3 million queries per second [2].
 
-That same year, the pandemic-driven remote-work surge tested the new architecture directly: query rates jumped 50% in a single week, and Vitess was able to split an overloaded keyspace's busiest shard into two, live, without customer-visible downtime [2].
+That same year, the pandemic-driven remote-work surge tested the new architecture directly: query rates jumped 50% in a single week, and Slack scaled one of its busiest keyspaces horizontally with Vitess's splitting workflows — without that, it says, the largest customers would have seen downtime [2].
 
-**2021 — the network layer proves that application-level resilience isn't the whole story.** A five-hour global outage on January 4, 2021 was triggered not by an application bug but by an overloaded AWS Transit Gateway — the network layer underneath everything Slack had built [7].
+**2021 — the network layer proves that application-level resilience isn't the whole story.** A multi-hour global outage on January 4, 2021 was triggered not by an application bug but by an overloaded AWS Transit Gateway — the network layer underneath everything Slack had built [7].
 
 Full details are in the failure section below.
 
@@ -267,7 +379,7 @@ Walking through it:
 
    The Webapp hands it to a stateless Admin Server, which routes it to the correct Channel Server using consistent hashing on the channel ID [1].
 
-4. **The Channel Server is the source of truth for that slice of channels.** Channel Servers are stateful and in-memory, each owning a subset of all channels — at peak, a single host has served roughly 16 million channels [1].
+4. **The Channel Server owns that slice of channels.** Channel Servers are stateful and in-memory, each owning a subset of all channels — at peak, a single host has served roughly 16 million channels [1].
 
    Once the Channel Server accepts the message, it pushes it out to every Gateway Server currently subscribed to that channel.
 
@@ -301,7 +413,7 @@ sequenceDiagram
   WA->>AS: Forward message
   AS->>CS: Write to channel, consistent-hash routed
   CS-->>AS: Acknowledged
-  AS->>JQ: Enqueue async jobs, search index, notifications
+  WA->>JQ: Enqueue async jobs, search index, notifications
   CS->>GS: Push to every subscribed Gateway Server
   GS-->>R: WebSocket message event
   JQ->>R: Push notification, if client is offline
@@ -429,25 +541,25 @@ Slack deliberately evaluated and rejected both NoSQL options (DynamoDB, Cassandr
 
 Slack didn't just adopt Vitess passively — it became a significant contributor upstream, working on topology-service scalability, MySQL compatibility gaps, data-migration tooling, load testing, and integrations with Prometheus and Orchestrator [2].
 
-The payoff showed up concretely in March 2020: when pandemic-driven remote work spiked query rates 50% in a single week, Vitess let Slack split an overloaded keyspace's busiest shard live, without customer-visible downtime — exactly the flexibility the original workspace-only sharding scheme couldn't offer [2].
+The payoff showed up concretely in March 2020: when pandemic-driven remote work spiked query rates 50% in a single week, Slack scaled one of its busiest keyspaces horizontally with Vitess's splitting workflows, avoiding the downtime its largest customers would otherwise have faced — exactly the flexibility the original workspace-only sharding scheme couldn't offer [2].
 
-### The job queue: from a Redis outage near-miss to a Kafka-backed pipeline
+### The job queue: from a Redis outage to a Kafka-backed pipeline
 
 > **Why this matters:** this is a clean example of upgrading a queue's durability guarantees *after* nearly being burned by their absence, rather than over-engineering durability in from day one.
 
 Slack's job queue handles the asynchronous side of nearly everything: every message post, push notification, URL unfurl, calendar reminder, and billing calculation that doesn't need to complete before a web request returns [4].
 
-The original design ran entirely on Redis. When enqueue rates outpaced dequeue rates for long enough — exactly the kind of thing that happens during a traffic spike — Redis would eventually run out of memory and cause an outage.
+The original design ran entirely on Redis. When enqueue rates outpaced dequeue rates for long enough, Redis would eventually run out of memory and cause an outage.
 
-That's close to what happened in a real incident roughly a year before Slack's own account was published [4].
+That is what happened roughly a year before Slack's account was published: database contention slowed job execution, Redis hit its maximum configured memory, and new jobs could not be enqueued [4].
 
 The fix added two small Go services rather than replacing the whole pipeline. **Kafkagate** exposes a simple HTTP endpoint that lets the PHP/Hack web application drop a job onto a specific Kafka topic and partition.
 
-**JQRelay** relays jobs from Kafka into the existing Redis-based worker clusters, using Consul locks to guarantee exactly one relay process owns each partition at a time [4].
+**JQRelay** relays jobs from Kafka into the existing Redis-based worker clusters, using Consul locks to guarantee exactly one relay process owns each Kafka topic at a time [4].
 
 This design keeps Kafka as a durable buffer in front of Redis rather than removing Redis entirely — jobs survive a Redis blip because Kafka is still holding them, and JQRelay can apply rate limiting and retry logic as it drains the backlog back into Redis [4].
 
-The Kafka cluster itself ran on 16 brokers with 32 partitions per topic, replication factor 3, and rack-aware placement across AWS availability zones, tuned specifically for durability under exactly this kind of spike [4].
+The Kafka cluster itself ran on 16 brokers with 32 partitions per topic, replication factor 3, 2-day retention, and rack-aware placement across AWS availability zones — though Kafkagate waits only for the leader's ack and unclean leader election is enabled, a deliberate lean toward availability over strict durability [4].
 
 ### Unified Grid: making an organization feel like one thing across many workspaces
 
@@ -485,7 +597,7 @@ Every user searches their own unique set of documents, queries rarely repeat acr
 
 In exchange, Slack's search gets real advantages web search doesn't: no spam to filter, a much smaller per-team corpus, and rich interaction history to mine for training signal — all of which let it justify computing more per message than a general web search engine reasonably could [6].
 
-The 2017 rollout of this re-ranking approach, to half of users, measured a 9% increase in clicked searches and a 27% increase in position-1 clicks. That's meaningful given Slack's own stated motivation that knowledge workers spend roughly 20% of a workday just looking for information [6].
+The November 2016 rollout of this re-ranking approach, to half of users, measured a 9% increase in clicked searches and a 27% increase in position-1 clicks. That's meaningful given Slack's own stated motivation that knowledge workers spend roughly 20% of a workday just looking for information [6].
 
 ## What happens when things break
 
@@ -503,7 +615,7 @@ The 2017 rollout of this re-ranking approach, to half of users, measured a 9% in
 
 - *Why recovery took until mid-morning:* the underlying fix required AWS engineers to manually increase Transit Gateway capacity across every affected availability zone, which is not something Slack's own systems could trigger on their own [7].
 
-- *What changed afterward:* Slack moved its monitoring and dashboarding services into the same network path as the databases they query (removing the shared-failure-domain problem), added regular load testing specifically for the provisioning service, and reviewed its health-check and autoscaling logic so "CPU looks idle" isn't read as "this server is fine to remove" when the real cause is an upstream network problem [7].
+- *What changed afterward:* Slack planned to run its dashboard services in the same VPC as their databases (removing the Transit Gateway dependency), to regularly load test the provisioning service, and to re-evaluate its health-check and autoscaling configuration so "CPU looks idle" isn't read as "this server is fine to remove" when the real cause is an upstream network problem [7].
 
 - *The generalizable lesson:* the outage's severity came almost entirely from *automated systems reacting badly to a network problem* — autoscaling removing capacity, provisioning hitting its own limits, monitoring sharing the failed network path — rather than from the network problem itself, which is a strong argument for testing your automation's behavior under partial, weird failure, not just clean total failure.
 
@@ -513,9 +625,9 @@ The 2017 rollout of this re-ranking approach, to half of users, measured a 9% in
 
 - *What happened:* that job queried subscription data across *all* channels rather than a properly scoped subset, and separately spawned an individual "leave channel" job for every channel membership being removed — generating a disproportionate burst of load on one Vitess shard that happened to hold a comparatively small slice (about 6%) of the affected customer's data [5].
 
-- *Why it cascaded:* the resulting replication lag pushed past a one-hour threshold Slack uses to pull replicas out of service, which reduced the shard's effective serving capacity right as load on it was spiking, and out-of-memory conditions began cascading across replicas [5].
+- *Why it cascaded:* replicas fell behind (replication lag), and the write load made the Vitess tablet on the shard primary run out of memory; the kernel OOM-killed MySQL, a replica was promoted, the new primary OOMed too, and replacement automation kept misjudging new replicas as unhealthy — an infinite loop of primary failures [5].
 
-- *What changed afterward:* Slack introduced circuit breakers and a tablet-level throttler to detect and back off from exactly this pattern, and restructured the underlying jobs to batch operations instead of spawning one job per channel per user [5].
+- *What changed afterward:* the owning team fixed the "leave channel" job's over-broad queries (scoping them to the one channel being left), jobs got exponential backoff and circuit breakers, and the Datastores team adopted throttling and circuit breakers to protect the database [5].
 
 - *The generalizable lesson:* a perfectly healthy, well-architected sharded database can still be brought down by one inefficiently-scoped background job — infrastructure-level scalability (Vitess) and application-level query discipline are separate concerns, and you need both.
 
@@ -523,7 +635,7 @@ The 2017 rollout of this re-ranking approach, to half of users, measured a 9% in
 
 - *Trigger:* a sustained period where jobs were being enqueued faster than they could be dequeued and processed.
 - *What happened:* Redis, holding the entire queue in memory with no durable buffer in front of it, eventually ran out of memory.
-- *Why this counts as a design gap, not bad luck:* the outage wasn't caused by a spike in *processing* failures — it was a straightforward capacity mismatch between two rates (enqueue vs. dequeue) that nothing in the system was reconciling [4].
+- *Why this counts as a design gap, not bad luck:* the trigger was database contention slowing job execution, but the outage came from a capacity mismatch between two rates (enqueue vs. dequeue) with no durable buffer to absorb it [4].
 - *Why the fix (Kafka in front of Redis) generalizes:* putting a durable, replicated buffer in front of an in-memory queue means a temporary processing slowdown turns into a growing backlog instead of an outage. The system degrades by getting behind, which is recoverable, rather than by falling over, which isn't.
 
 **A workspace with tens of thousands of members, before Flannel existed.**
@@ -565,29 +677,31 @@ The 2017 rollout of this re-ranking approach, to half of users, measured a 9% in
 
 ## Glossary
 
-- **WebSocket**: a persistent, two-way connection between a client and server, used here so the server can push new messages the instant they happen instead of the client having to repeatedly ask "anything new?"
-- **Consistent hashing**: a way of mapping keys (like channel IDs) to servers such that adding or removing one server only reassigns the small slice of keys that mapped to it, instead of reshuffling everything.
+New to these terms? The [concepts](../concepts/README.md) folder explains the core ideas in depth.
+
+- **[WebSocket](../concepts/persistent-connections.md)**: a persistent, two-way connection between a client and server, used here so the server can push new messages the instant they happen instead of the client having to repeatedly ask "anything new?"
+- **[Consistent hashing](../concepts/consistent-hashing.md)**: a way of mapping keys (like channel IDs) to servers such that adding or removing one server only reassigns the small slice of keys that mapped to it, instead of reshuffling everything.
 - **Hash ring**: the conceptual circle consistent hashing maps both keys and servers onto, used to determine which server owns which key.
 - **CHARM (Consistent Hash Ring Manager)**: Slack's internal component that manages the Channel Server hash ring, including detecting unhealthy servers and provisioning replacements.
-- **Envoy**: an open-source network proxy used here as an edge load balancer, routing client connections to the nearest Gateway Server.
+- **[Envoy](../concepts/load-balancing.md)**: an open-source network proxy used here as an edge load balancer, routing client connections to the nearest Gateway Server.
 - **Consul**: a service-discovery tool used to track which servers are currently healthy and where to route requests.
 - **Channel Server**: a stateful Slack server holding a subset of all channels and their recent history, chosen by consistent hashing.
-- **Gateway Server**: a stateful Slack server, deployed at the network edge, holding a connected client's WebSocket and its channel subscriptions.
+- **[Gateway Server](../concepts/persistent-connections.md)**: a stateful Slack server, deployed at the network edge, holding a connected client's WebSocket and its channel subscriptions.
 - **Admin Server**: a stateless Slack server sitting between the Webapp and Channel Servers, routing requests to the right one.
 - **Presence Server**: a Slack server tracking which users are currently online.
-- **Vitess**: an open-source system, originally built at YouTube, that adds flexible horizontal sharding, automatic failover, and topology management on top of ordinary MySQL.
+- **[Vitess](../concepts/sharding.md)**: an open-source system, originally built at YouTube, that adds flexible horizontal sharding, automatic failover, and topology management on top of ordinary MySQL.
 - **VTGate**: Vitess's query-routing layer, which a client talks to as if it were a single MySQL database, while VTGate transparently routes each query to the correct shard.
 - **vttablet**: the Vitess component that sits in front of one actual MySQL instance (one shard), managing it on Vitess's behalf.
 - **Keyspace (in Vitess)**: a logical grouping of related sharded tables, roughly analogous to "a database" in ordinary MySQL terms.
-- **Resharding**: splitting or merging the shards underlying a keyspace, ideally without taking the data offline.
-- **Replication lag**: how far behind a database replica is from the primary it's copying from; too much lag makes a replica's data too stale to safely serve reads from.
-- **Kafka**: a distributed, durable, append-only log used here as a buffer in front of Slack's job queue, so jobs survive even if the downstream worker system is temporarily overwhelmed.
+- **[Resharding](../concepts/sharding.md)**: splitting or merging the shards underlying a keyspace, ideally without taking the data offline.
+- **[Replication lag](../concepts/replication.md)**: how far behind a database replica is from the primary it's copying from; too much lag makes a replica's data too stale to safely serve reads from.
+- **[Kafka](../concepts/message-queues-and-logs.md)**: a distributed, durable, append-only log used here as a buffer in front of Slack's job queue, so jobs survive even if the downstream worker system is temporarily overwhelmed.
 - **Topic / partition (Kafka)**: a topic is a named stream of records; a partition is one ordered, independently-consumable slice of that stream, used to parallelize processing.
 - **Redis**: an in-memory data store; used by Slack's job queue as the actual work queue that job workers pull from, with Kafka added in front of it for durability.
-- **Job queue**: a system for running work asynchronously, outside the request/response cycle of the action that triggered it.
+- **[Job queue](../concepts/message-queues-and-logs.md)**: a system for running work asynchronously, outside the request/response cycle of the action that triggered it.
 - **Circuit breaker**: a safety mechanism that detects a downstream dependency is failing and temporarily stops sending it requests, to avoid making the failure worse.
-- **Throttler**: a mechanism that deliberately slows down or limits a flow of requests to keep a downstream system from being overwhelmed.
-- **Flannel**: Slack's application-level edge cache, serving a slimmed-down snapshot of team data to new or reconnecting clients.
+- **[Throttler](../concepts/rate-limiting.md)**: a mechanism that deliberately slows down or limits a flow of requests to keep a downstream system from being overwhelmed.
+- **[Flannel](../concepts/caching.md)**: Slack's application-level edge cache, serving a slimmed-down snapshot of team data to new or reconnecting clients.
 - **Reconnect storm**: a surge of near-simultaneous reconnection attempts (e.g., after a network blip or everyone returning to work Monday morning), which can overwhelm backend systems if not specifically defended against.
 - **Solr / Lucene**: Solr is a search server built on top of Lucene, the underlying text-indexing and scoring library; Slack uses Solr for the first-pass retrieval step of search.
 - **Re-ranking**: taking an initial, cheaply-computed set of search results and reordering them using a more expensive, more accurate scoring model.

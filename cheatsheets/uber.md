@@ -29,7 +29,7 @@ flowchart LR
 | Gross bookings | $54.1 billion (Q4 2025 quarter) | [Uber Q4 2025 results](https://investor.uber.com/news-events/news/press-release-details/2026/Uber-Announces-Results-for-Fourth-Quarter-and-Full-Year-2025/default.aspx) |
 | Geofence lookup peak load | 170,000 queries/sec across 40 machines at 35% CPU, p95 <5ms, p99 <50ms | [Go geofence service](https://www.uber.com/us/en/blog/go-geofence-highest-query-per-second-service/) |
 | Location-update write target | ~1 million writes/sec design goal, drivers pinging roughly every 4 seconds | [Scaling Uber's Real-time Market Platform](https://www.infoq.com/presentations/uber-market-platform/) |
-| Schemaless shard count | 4,096 shards, production since October 2014 | [Schemaless part one](https://www.uber.com/us/en/blog/schemaless-part-one-mysql-datastore/) |
+| Schemaless shard count | 4,096 shards, production since October 2014 | [Schemaless part two](https://www.uber.com/us/en/blog/schemaless-part-two-architecture/) |
 | H3 resolution levels | 16 resolutions (0 coarsest to 15 finest), 122 base cells | [H3](https://www.uber.com/us/en/blog/h3/) |
 | Edge API surface | 600+ stateless Frontline HTTP endpoints (2016) | [Uber tech stack part II](https://www.uber.com/us/en/blog/uber-tech-stack-part-two/) |
 

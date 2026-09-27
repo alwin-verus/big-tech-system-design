@@ -12,7 +12,7 @@ WhatsApp routes messages through a fleet of Erlang processes on tuned FreeBSD bo
 flowchart LR
   A["Sender client"] --> LB["Connection router"]
   LB --> CS1["Erlang connection server<br/>~1M conns/box"]
-  CS1 --> ROUTE[("Mnesia routing table")]
+  CS1 --> ROUTE[("Routing table<br/>Mnesia, reference design")]
   ROUTE --> CS2["Connection server<br/>holds recipient session"]
   CS2 -->|"online"| B["Recipient device"]
   CS2 -->|"offline"| Q[("Per-recipient<br/>offline queue")]
@@ -21,14 +21,14 @@ flowchart LR
   CS1 --> KS[("Key server<br/>prekeys")]
 ```
 
-One connection server routes to another via the shared Mnesia table; an offline recipient waits in a small queue until a push notification wakes their phone.
+One connection server routes to another via a shared in-memory routing table (Mnesia in this page's reference design); an offline recipient waits in a small queue until a push notification wakes their phone.
 
 ## Numbers worth remembering
 
 | Metric | Number | Source |
 |---|---|---|
 | Monthly active users | 3 billion+ (Apr 2025) | [TechCrunch](https://techcrunch.com/2025/05/01/whatsapp-now-has-more-than-3-billion-users/) |
-| Community size limit | up to 100 groups / 2,000 members (2022) | [WhatsApp Blog](https://blog.whatsapp.com/communities-now-available) |
+| Community size limit | up to 100 groups / 2,000 members (2022) *(unverified: not in the cited post)* | [WhatsApp Blog](https://blog.whatsapp.com/communities-now-available) |
 | Peak concurrent connections | 147 million (2014) | [High Scalability](https://highscalability.com/how-whatsapp-grew-to-nearly-500-million-users-11000-cores-an/) |
 | Connections per server | ~1,000,000 average (2014) | [High Scalability](https://highscalability.com/how-whatsapp-grew-to-nearly-500-million-users-11000-cores-an/) |
 | Backend/ops engineers | ~10, ~40M users each (2014) | [High Scalability](https://highscalability.com/how-whatsapp-grew-to-nearly-500-million-users-11000-cores-an/) |
@@ -44,7 +44,7 @@ One connection server routes to another via the shared Mnesia table; an offline 
 - **No server-side message store:** the server keeps routing info and undelivered ciphertext, not a searchable history — minimizes what a breach or subpoena could expose.
 - **Client-fanout for multi-device:** the sender encrypts once per recipient *device*, keeping the server blind to plaintext even across 5 linked devices.
 - **Sender Keys for groups:** avoids O(n²) pairwise sessions in a group by having each member distribute one shared key once, at the cost of weaker per-message guarantees.
-- **Capped group/Community size (1,024 / 2,000):** bounds the re-keying burst that happens whenever someone is removed from a group.
+- **Capped group size (1,024):** plausibly bounds the re-keying burst that happens whenever someone is removed from a group (inference; the cap's reason isn't published).
 
 ## If an interviewer asks "design WhatsApp"
 

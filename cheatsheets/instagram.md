@@ -4,7 +4,7 @@
 
 ## In 60 seconds
 
-Instagram started in 2010 as a single Django + PostgreSQL box and grew into a Django monolith with millions of lines of code serving over a billion users, deployed 30-50 times a day. Unique IDs are minted independently inside thousands of sharded PostgreSQL schemas using a scheme conceptually like Twitter's Snowflake, but implemented with plain PL/pgSQL instead of a separate ID service. Feed, Stories, Reels, comments, and notifications are each ranked by one of 1,000+ machine-learning models running in a multi-stage retrieval-then-ranking funnel. Write-heavy social data (activity, feed edges) lives in Apache Cassandra, whose storage engine Instagram rebuilt on RocksDB ("Rocksandra") to cut tail latency 3x. Photos and video are processed into multiple resolutions and served from object storage behind a CDN, entirely off Instagram's application servers.
+Instagram started in 2010 as a single Django + PostgreSQL box and grew into a Django monolith with millions of lines of code serving over a billion users, deployed 30-50 times a day. Unique IDs are minted independently inside thousands of sharded PostgreSQL schemas using a scheme conceptually like Twitter's Snowflake, but implemented with plain PL/pgSQL instead of a separate ID service. Feed, Stories, Reels, comments, and notifications are each ranked by one of 1,000+ machine-learning models running in a multi-stage retrieval-then-ranking funnel. Write-heavy social data (activity, feed edges) lives in Apache Cassandra, whose storage engine Instagram rebuilt on RocksDB ("Rocksandra") to cut tail latency 3x. Photos are stored in object storage and served through a CDN, entirely off Instagram's application servers.
 
 ## The picture
 
@@ -32,7 +32,7 @@ flowchart LR
 | Photos moved off AWS, 2014 | 20 billion+ photos migrated to Facebook's own data centers | [Instagram moves 20 billion images](https://siliconangle.com/2014/06/30/instagram-migrates-20-billion-images-shifted-to-facebooks-servers/) |
 | Cassandra tail latency, before/after Rocksandra | P99 read latency ~60ms -> ~20ms (3x reduction) | [Open-sourcing a 10x reduction in Cassandra tail latency](https://medium.com/instagram-engineering/open-sourcing-a-10x-reduction-in-apache-cassandra-tail-latency-d64f86b43589) |
 | ML models in production, 2025 | 1,000+ models across Feed, Stories, Reels, comments, notifications | [Journey to 1000 models](https://engineering.fb.com/2025/05/21/production-engineering/journey-to-1000-models-scaling-instagrams-recommendation-system/) |
-| Explore candidate-to-shown ratio, 2023 | billions of candidate posts narrowed to roughly 100 shown | [Scaling Instagram Explore recommendations](https://engineering.fb.com/2023/08/09/ml-applications/scaling-instagram-explore-recommendations-system/) |
+| Explore candidate-to-shown ratio, 2023 | billions of candidate posts narrowed to the ~100 best that the heavy second-stage model scores | [Scaling Instagram Explore recommendations](https://engineering.fb.com/2023/08/09/ml-applications/scaling-instagram-explore-recommendations-system/) |
 | Explore scale, 2019 | ~65 billion features evaluated, ~90 million predictions/sec | [Powered by AI: Instagram's Explore recommender](https://ai.meta.com/blog/powered-by-ai-instagrams-explore-recommender-system/) |
 
 ## Signature ideas
@@ -42,14 +42,14 @@ flowchart LR
 - **Stay a monolith, invest in tooling** — canary deploys plus static analysis let hundreds of engineers ship into one Django codebase daily instead of splitting into microservices.
 - **Rocksandra** — swap Cassandra's JVM storage engine for RocksDB (C++, no GC pauses) while keeping its distributed-systems layer, cutting P99 read latency 3x.
 - **Model Registry + calibration/normalized-entropy monitoring** — automatically flag any of 1,000+ models the moment it silently degrades, instead of waiting for a human to notice.
-- **Media bytes never touch the app database** — only a pointer is stored; resizing and fan-out happen asynchronously off the upload request.
+- **Media bytes never touch the app database** — only a pointer is stored; slow work (cross-posting, notifications, fan-out) happens asynchronously off the upload request.
 
 ## If an interviewer asks "design Instagram"
 
 1. Clarify scope: upload photo/video, generate a ranked Feed/Stories/Reels/Explore, support the social graph (follow/like/comment), notify.
 2. Mint unique IDs at write time inside each database shard (timestamp + shard + sequence bits) so no shard ever needs to coordinate with another.
 3. Keep post/user metadata in sharded PostgreSQL; keep high-write, high-fan-out data (activity/feed events) in Cassandra instead.
-4. On upload, write raw media to object storage and enqueue async work (resizing, fan-out) so the request returns fast.
+4. On upload, write raw media to object storage and enqueue async work (fan-out, cross-posting, notifications) so the request returns fast.
 5. On feed load, run candidates through a staged funnel: cheap retrieval over billions, then progressively heavier ranking on a shrinking shortlist.
 6. Cache aggressively (Redis/Memcached) in front of both stores, since reads vastly outnumber writes.
 7. Deploy continuously via canary (a small slice of servers first, then fleet-wide) instead of coordinating one big release train across a monolith.

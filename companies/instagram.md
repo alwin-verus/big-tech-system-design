@@ -1,6 +1,6 @@
 # Instagram: how a feed for billions of people ranks itself in milliseconds
 
-> **In 60 seconds:** Instagram started in 2010 as a single Django + PostgreSQL box and grew into a Django monolith with millions of lines of code serving over a billion users, deployed roughly 30-50 times a day [9]. Unique IDs are minted independently inside thousands of sharded PostgreSQL schemas using a scheme conceptually like Twitter's Snowflake, but implemented with plain PL/pgSQL instead of a separate ID service [1]. Feed, Stories, Reels, comments, and notifications are each ranked by one of 1,000+ machine-learning models running in a multi-stage retrieval-then-ranking funnel [6][7]. Write-heavy social data (activity, feed edges) lives in Apache Cassandra, whose storage engine Instagram rebuilt on RocksDB ("Rocksandra") to cut tail latency 3x [3]. Photos and video are processed into multiple resolutions and served from object storage behind a CDN, entirely off Instagram's application servers [2].
+> **In 60 seconds:** Instagram started in 2010 as a single Django + PostgreSQL box and grew into a Django monolith with millions of lines of code serving over a billion users, deployed roughly 30-50 times a day [4][9]. Unique IDs are minted independently inside thousands of sharded PostgreSQL schemas using a scheme conceptually like Twitter's Snowflake, but implemented with plain PL/pgSQL instead of a separate ID service [1]. Feed, Stories, Reels, comments, and notifications are each ranked by one of 1,000+ machine-learning models running in a multi-stage retrieval-then-ranking funnel [6][7]. Write-heavy social data (activity, feed edges) lives in Apache Cassandra, whose storage engine Instagram rebuilt on RocksDB ("Rocksandra") to cut tail latency 3x [3]. Photos are stored in object storage and served through a CDN, entirely off Instagram's application servers [2].
 
 **Last reviewed:** September 2026 · **Difficulty:** Intermediate · **Reading time:** ~30 min
 
@@ -9,6 +9,7 @@
 - [Before you read: design it yourself](#before-you-read-design-it-yourself)
 - [The problem](#the-problem)
 - [Scale](#scale)
+- [Back-of-the-envelope math](#back-of-the-envelope-math)
 - [Requirements](#requirements)
 - [How it evolved](#how-it-evolved)
 - [High-level design](#high-level-design)
@@ -66,7 +67,7 @@ Consider that the thing that needs to scale isn't the number of services — it'
 
 <details><summary>How Instagram does it</summary>
 
-Instagram never had a forcing function that pushed it into microservices — instead it stayed one Django monolith (several million lines, a few thousand endpoints) and invested in the tooling to keep that safe: a canary pipeline (Sauron for release tracking, Jenkins for test gating, Fabric for rollout scripting) pushes new code to a small slice of servers first and only promotes fleet-wide if error rates stay healthy, schema changes ship as feature-toggled dual-read/dual-write paths instead of one-shot migrations, and static-analysis tooling scans the whole codebase for known-bad patterns instead of relying purely on human code review. Cost: a slow or flaky test suite becomes everyone's problem at once, since every engineer's change lands in the same shared codebase.
+Instagram never had a forcing function that pushed it into microservices — instead it stayed one Django monolith (several million lines, a few thousand endpoints) and invested in the tooling to keep that safe: a canary pipeline (Sauron for release tracking, Jenkins for test gating, Facebook's distributed SSH system for the rollout itself, replacing earlier Fabric scripts) pushes new code to a small slice of servers first and only promotes fleet-wide if error rates stay healthy, schema changes ship as feature-toggled dual-read/dual-write paths instead of one-shot migrations, and static-analysis tooling scans the whole codebase for known-bad patterns instead of relying purely on human code review. Cost: a slow or flaky test suite becomes everyone's problem at once, since every engineer's change lands in the same shared codebase.
 
 Deep dive: [The Django monolith at scale](#the-django-monolith-at-scale)
 
@@ -82,7 +83,7 @@ Think about metrics that catch a model quietly degrading toward "no better than 
 
 <details><summary>How Instagram does it</summary>
 
-Every model in a shared **Model Registry** gets tracked on two health metrics: **calibration** (ratio of predicted to actually-observed click-through rate — 1 is trustworthy) and **normalized entropy** (how well it still separates "will happen" from "won't" — near 1 means it has degraded to guessing). A model breaching its healthy range on either metric gets flagged automatically, and every new model rollout ramps up gradually while shifting traffic — rather than one 100% cutover — so a regression caught mid-rollout only ever affects a bounded slice of traffic.
+Every model in a shared **Model Registry** gets tracked on two health metrics: **calibration** (ratio of predicted to actually-observed click-through rate — 1 is trustworthy) and **normalized entropy** (how well it still separates "will happen" from "won't" — near 1 means it has degraded to guessing). A model breaching its healthy range on either metric gets flagged automatically, and every new model rollout ramps up gradually while shifting traffic — rather than one 100% cutover — so a regression caught mid-rollout only ever affects a bounded slice of traffic *(inference: the source describes gradual traffic shifting and stability alerting, not an automatic link between them)*.
 
 Deep dive: [What happens when things break](#what-happens-when-things-break)
 
@@ -109,17 +110,16 @@ Both of those things have to happen at a scale where a single database, a single
 | Photo/like write rate, 2011 | ~25 photos/sec, ~90 likes/sec | [1] |
 | Deploys per day, 2016 | 30-50 deploys/day across thousands of machines | [9] |
 | Photos moved off AWS, 2014 | 20 billion+ photos migrated to Facebook's own data centers | [10][11] |
-| Migration team size, 2014 | grew from 8 to 20 engineers for the AWS-to-Facebook move | [10] |
-| Users during the 2014 migration | ~200 million, roughly doubling while the migration was still in progress | [10] |
-| Interim VPC migration, 2014 | ~3 weeks to move onto AWS VPC, as a prerequisite before the full Facebook data-center cutover | [10] |
-| Facebook data-center efficiency, 2014 | ~38% more efficient and ~24% cheaper to run than the average data center of the time | [11] |
+| Users during the 2014 migration | ~200 million, roughly doubling while the migration was still in progress | [11] |
+| Interim VPC migration, 2014 | ~3 weeks to move onto AWS VPC, as a prerequisite before the full Facebook data-center cutover | [11] |
+| Facebook data-center efficiency, 2014 | ~38% more efficient and ~24% cheaper to run than the average data center of the time | [10] |
 | Cassandra tail latency before Rocksandra | P99 read latency ~60ms | [3] |
 | Cassandra tail latency after Rocksandra | P99 read latency ~20ms (3x reduction) | [3] |
-| GC stalls before/after Rocksandra | 2.5% of reads -> 0.3% of reads (10x reduction) | [3] |
+| GC stalls before/after Rocksandra | 2.5% -> 0.3% of server runtime spent in stop-the-world GC (10x reduction) | [3] |
 | ML models in production, 2025 | 1,000+ models across Feed, Stories, Reels, comments, notifications | [6] |
 | Explore daily reach, 2023 | hundreds of millions of people visit Explore daily | [7] |
 | Explore monthly reach, 2019 | over half of Instagram's monthly users visited Explore | [19] |
-| Explore candidate-to-shown ratio, 2023 | billions of candidate posts narrowed to roughly 100 shown per request | [7] |
+| Explore candidate-to-shown ratio, 2023 | billions of candidate posts narrowed to the ~100 best that the heavy second-stage model scores | [7] |
 | Explore scale, 2019 | ~65 billion features evaluated and ~90 million model predictions served, every second | [19] |
 | Model launch velocity, 2025 | a few launches/week -> 10+ launches/week after tooling investment | [6] |
 | Engineer-time saved per launch, 2025 | 2+ days saved per model launch after automating what used to be manual 20% traffic-shift steps | [6] |
@@ -127,6 +127,109 @@ Both of those things have to happen at a scale where a single database, a single
 These numbers describe two different scaling problems that show up throughout this page: raw write throughput (25 photos/sec sounds small today, but it drove a from-scratch ID design in 2011) and *ranking* throughput — going from one global sort order to over a thousand purpose-built models is what it takes to keep ranking relevant once "everyone you follow" stops being a small list.
 
 The AWS-to-Facebook migration number (20 billion photos, zero downtime) is a reminder that "hard scale problems" aren't only steady-state traffic — one-time migrations at this size are themselves a systems-design problem, and the platform-tooling numbers (1,000+ models, calibration/NE monitoring) are a reminder that at a certain point, *managing* scale becomes its own separate scale problem, distinct from serving traffic at all [6].
+
+## Back-of-the-envelope math
+
+This is the rough arithmetic engineers sketch on a whiteboard to size a system before writing any code — good enough to catch a design that's off by orders of magnitude, not meant to be exact. Inputs marked [n] are pulled straight from the [Scale](#scale) table above and match it exactly; everything else is an explicit **Assumption**, never presented as fact.
+
+### 1. Photos and likes per day at the 2011 write rate, and the storage that implies
+
+**Question:** At Instagram's 2011 write rate (~25 photos/sec, ~90 likes/sec) [1], how many photos and likes accumulate in a day, and how much storage does a day of photos need?
+
+**Inputs:**
+- Photo write rate, 2011: ~25 photos/sec [1]
+- Like write rate, 2011: ~90 likes/sec [1]
+- 1 day = 86,400 s (rule of thumb)
+- Assumption: average photo size ≈ 200 KB (a compressed JPEG upload, one baseline copy before multiple resolutions)
+
+**Math:**
+```text
+photos/day = 25 photos/s × 86,400 s/day
+           = 2,160,000 photos/day  (~2.16M/day)
+
+likes/day = 90 likes/s × 86,400 s/day
+          = 7,776,000 likes/day  (~7.78M/day)
+
+storage/day (photos only) = 2,160,000 photos × 200 KB
+                           = 432,000,000 KB
+                           = 432,000 MB
+                           = 432 GB/day
+```
+
+**Answer:** ~2.16M photos/day, ~7.78M likes/day, and ~432 GB/day of raw photo storage at the 2011 rate.
+
+**What it tells you:** even this "small" 2011 write rate needed a from-scratch ID scheme — ~2.16M new photo IDs/day, generated across thousands of independent database shards, meant no single central counter could keep up without becoming a bottleneck or single point of failure. See [The sharded ID scheme](#the-sharded-id-scheme-instagrams-alternative-to-snowflake).
+
+### 2. Features evaluated per single Explore prediction
+
+**Question:** In 2019, Explore evaluated ~65 billion features and served ~90 million model predictions, every second [19] — how many features does that work out to per single prediction?
+
+**Inputs:**
+- Explore scale, 2019: ~65 billion features/sec, ~90 million predictions/sec [19]
+
+**Math:**
+```text
+features/prediction = 65,000,000,000 / 90,000,000
+                     = 722.2 features per prediction  (~722)
+```
+
+**Answer:** ~722 features evaluated per model prediction.
+
+**What it tells you:** that's a rich feature vector for a single real-time ranking decision, which pushes ranking toward the multi-stage funnel Explore actually runs — a cheap first pass narrows billions of candidates before the expensive ~722-feature model ever touches them. See [Feed and Explore ranking](#feed-and-explore-ranking-from-one-sort-order-to-1000-models).
+
+### 3. How selective the Explore funnel actually is
+
+**Question:** Explore in 2023 narrows "billions of candidate posts" down to the ~100 best that the heavy second-stage model scores [7] — treating "billions" conservatively as 2 billion, what selectivity does the funnel achieve?
+
+**Inputs:**
+- Explore candidate-to-shown ratio, 2023: billions of candidates → ~100 shown [7]
+- Assumption: "billions" ≈ 2,000,000,000 (a conservative low-end reading of the plural)
+
+**Math:**
+```text
+candidates per surviving post = 2,000,000,000 / 100
+                                = 20,000,000
+
+selectivity = 100 / 2,000,000,000
+             = 0.00000005  (5 × 10^-8)
+```
+
+**Answer:** roughly 1 candidate survives out of every 20 million (assuming "billions" ≈ 2B) — even at a much higher "billions" reading (say 10B), it's still about 1-in-100-million.
+
+**What it tells you:** a filter that aggressive can't be one expensive model run over every candidate — it has to be a cheap, cascading multi-stage funnel where each stage discards most of what the previous stage kept, and only the smallest surviving set gets the expensive treatment. See [Feed and Explore ranking](#feed-and-explore-ranking-from-one-sort-order-to-1000-models).
+
+### 4. Wall-clock GC time reclaimed per server by Rocksandra
+
+**Question:** Rocksandra cut stop-the-world GC time from 2.5% to 0.3% of server runtime [3] — over a 24-hour day, how much wall-clock time per server did that reclaim?
+
+**Inputs:**
+- GC stalls before/after Rocksandra: 2.5% → 0.3% of server runtime [3]
+
+**Math:**
+```text
+GC time before = 24 h × 0.025
+               = 0.6 h/day = 36 minutes/day
+
+GC time after = 24 h × 0.003
+              = 0.072 h/day = 4.32 minutes/day
+
+time reclaimed/server/day = 36 − 4.32
+                           = 31.68 minutes/day  (~32 minutes)
+```
+
+**Answer:** ~32 minutes of GC-stall time reclaimed per server per day (a ~10x reduction, matching the page's own framing).
+
+**What it tells you:** "10x fewer GC pauses" turns into a concrete ~32 minutes/server/day once converted to wall-clock time — at the thousands of machines behind Instagram's 2016 deploy scale [9], that's the difference between GC stalls being background noise and a capacity tax large enough to justify a purpose-built storage engine. See [Cassandra and the Rocksandra storage engine](#cassandra-and-the-rocksandra-storage-engine).
+
+**Rules of thumb used:**
+
+| Convention | Value used here |
+|---|---|
+| Time unit ladder | 1 day = 86,400 s; 1 day = 24 hours = 1,440 minutes |
+| Storage/byte ladder | 1,000 KB = 1 MB; 1,000 MB = 1 GB (decimal) |
+| "Billions" / "hundreds of millions" style figures | treated as the stated low-end round number (e.g. "billions" → 2 × 10^9) and flagged as an Assumption |
+| Percent-of-runtime figures | converted to wall-clock time via percentage × total period (e.g. 2.5% of 24h = 36 min) |
+| Peak vs. average | general convention: peak ≈ 2-3x daily average for systems with daily/weekly demand cycles (not directly needed above, since these figures were already rates or ratios) |
 
 ## Requirements
 
@@ -151,11 +254,11 @@ The AWS-to-Facebook migration number (20 billion photos, zero downtime) is a rem
 | Era | What Instagram ran | What broke / what changed |
 |---|---|---|
 | 2010 launch | Single Django + PostgreSQL box on AWS | Simplest thing that could work for a brand-new app |
-| 2011 (14M users, 3 engineers) | PostgreSQL split into thousands of logical shards (schemas) mapped onto a handful of physical DBs; Redis for photo-ID -> owner-ID lookups; Memcached; S3 + CloudFront for media; Gearman task queue for async fan-out and cross-posting | A single Postgres instance couldn't hold the write volume or dataset size; a custom sharded-ID scheme (see [Deep dives](#deep-dives)) was built so every shard could mint IDs independently [1][2] |
-| 2012 | Facebook acquires Instagram; Cassandra adopted for activity-feed / fraud-detection data, replacing part of the Redis footprint | Redis's all-in-RAM model got expensive as feed/activity data grew; Cassandra's disk-backed LSM-tree model cut that cost by roughly 75% while adding horizontal scale *(third-party)* [13] |
-| 2013-2014 | Instagram migrates fully off AWS onto Facebook's own data centers | 20 billion+ photos moved with zero user-visible downtime; migration team grew from 8 to 20 engineers over about a year of planning plus a month of execution; Instagram came out of it running on roughly a third fewer servers *(third-party)* [10][11] |
-| 2016 | Feed switches from strict reverse-chronological order to an ML-ranked order; continuous deployment matures (canary pushes via Sauron + Jenkins + Fabric, 30-50 deploys/day) | Users were missing the majority of posts from accounts they cared about under a pure time-ordered feed; a relevance-ranked order was rolled out instead *(third-party)* [9][16] |
-| ~2017-2019 | Cassandra clusters grow past 1,000 nodes | JVM garbage-collection pauses started dominating P99 read latency; Instagram built "Rocksandra," a RocksDB-backed pluggable storage engine for Cassandra, and open-sourced it, cutting P99 latency from ~60ms to ~20ms [3] |
+| 2011 (14M users, 3 engineers) | PostgreSQL split into thousands of logical shards (schemas) mapped onto a handful of physical DBs; Redis for the main feed, activity feed, and sessions; Memcached; S3 + CloudFront for media; Gearman task queue for async fan-out and cross-posting | A single Postgres instance couldn't hold the write volume or dataset size; a custom sharded-ID scheme (see [Deep dives](#deep-dives)) was built so every shard could mint IDs independently [1][2] |
+| 2012 | Facebook acquires Instagram; Instagram begins using Cassandra to replace Redis for fraud detection, Feed, and the Direct inbox | Redis requires all data to fit in RAM; Cassandra's disk-backed LSM-tree model adds horizontal scale [2][3] |
+| 2013-2014 | Instagram migrates fully off AWS onto Facebook's own data centers | 20 billion+ photos moved with zero user-visible downtime; about a year of planning plus a month of execution; Instagram came out of it running on roughly a third fewer servers *(third-party)* [10][11] |
+| 2016 | Feed switches from strict reverse-chronological order to an ML-ranked order; continuous deployment matures (canary pushes tracked in Sauron, gated by Jenkins, 30-50 deploys/day) | Users were missing the majority of posts from accounts they cared about under a pure time-ordered feed; a relevance-ranked order was rolled out instead *(third-party)* [9][16] |
+| ~2017-2018 | Cassandra grows into one of the world's largest deployments | JVM garbage-collection pauses were a major contributor to P99 read latency; Instagram built "Rocksandra," a RocksDB-backed pluggable storage engine for Cassandra, and open-sourced it, cutting P99 latency from ~60ms to ~20ms [3] |
 | 2019 | Explore ranking rebuilt around **ig2vec** account embeddings (word2vec-style), **FAISS** nearest-neighbor retrieval, and a three-pass ranking funnel (500 -> 150 -> 50 -> 25 candidates), running under a custom query language called **IGQL** | Candidate generation needed to scale past simple content classification, and engineers needed a way to write new ranking logic without hand-optimizing C++ for every change [19] |
 | 2023 | Explore recommendations become a four-stage funnel (retrieval -> first-stage ranking -> second-stage ranking -> integrity/diversity rerank) using Two-Tower neural networks and cached embeddings | Ranking billions of candidate items per request for hundreds of millions of daily visitors needed staged filtering instead of one big model scoring everything [7] |
 | 2025 | Recommendation system reaches 1,000+ models across Feed, Stories, Reels, comments, and notifications, backed by a shared Model Registry (on Meta's Configerator), an automated launch platform, and an SLO framework called SLICK | Running one model per surface stopped being enough — model *management* itself became the bottleneck, so Instagram built platform tooling around the models rather than one bigger model [6][8] |
@@ -172,23 +275,23 @@ Instagram launched as the simplest thing that could work: one Django application
 
 Rather than reach for an off-the-shelf distributed ID service, Instagram split Postgres into thousands of logical shards (schemas) and pushed ID generation down into each shard itself using a PL/pgSQL function — the scheme detailed in the [sharded ID deep dive](#the-sharded-id-scheme-instagrams-alternative-to-snowflake) below [1].
 
-Media never touched this database at all: photos went straight to S3, served through CloudFront, with a Redis-backed photo-ID-to-owner-ID mapping and a Gearman task queue handling everything that could happen asynchronously (resizing, cross-posting, fan-out) [2].
+Media never touched this database at all: photos went straight to S3, served through CloudFront, with Redis powering the main feed, activity feed, and sessions, and a Gearman task queue handling everything that could happen asynchronously (cross-posting, notifications, fan-out) [2].
 
 ### Joining Facebook's infrastructure (2012-2014)
 
-Facebook's 2012 acquisition — reported at roughly $1 billion, agreed before Instagram had even shipped an Android app — didn't immediately change Instagram's architecture, but it set up the next two big moves *(third-party)* [20]. First, Instagram adopted Cassandra for activity-feed and fraud-detection data, replacing the Redis footprint that had been growing expensive to keep entirely in RAM *(third-party)* [13].
+Facebook's 2012 acquisition — reported at roughly $1 billion, announced in April 2012, the same month the Android app shipped — didn't immediately change Instagram's architecture, but it set up the next two big moves *(third-party)* [20]. First, Instagram began using Cassandra in 2012 to replace Redis for fraud detection, Feed, and the Direct inbox [3].
 
-Second, and far larger in scope: over 2013-2014, Instagram moved off AWS entirely and onto Facebook's own data centers — a migration that turned out to be much harder than "copy the files over," because **Facebook's private internal IP address space directly conflicted with the IP address space Instagram's servers already occupied inside classic Amazon EC2** *(third-party)* [10].
+Second, and far larger in scope: over 2013-2014, Instagram moved off AWS entirely and onto Facebook's own data centers — a migration that turned out to be much harder than "copy the files over," because **Facebook's private internal IP address space directly conflicted with the IP address space Instagram's servers already occupied inside classic Amazon EC2** *(third-party)* [11].
 
-Classic EC2 had no built-in way to bridge or share security groups with Facebook's network, so the team first migrated Instagram's entire footprint onto **Amazon VPC** — a network product with more flexible IP addressing — purely to buy the room needed for the next step; the engineers who ran it (Rick Branson, Pedro Cahauati, and Nick Shortway) described it as the fastest VPC migration at that scale anyone had done, completed in about three weeks *(third-party)* [10].
+So the team first migrated Instagram's entire footprint onto **Amazon VPC**, whose "addressing flexibility" avoided conflicts with Facebook's private network, and planned to cross to Facebook over **Amazon Direct Connect**; the engineers who ran it (Rick Branson, Pedro Cahauati, and Nick Shortway) described it as the fastest VPC migration at that scale ever, completed in about three weeks *(third-party)* [11].
 
-To actually resolve the collision with Facebook's address space, they built **Neti**, a purpose-built daemon written in Python and coordinated through **Zookeeper**, that dynamically rewrote IP tables so Facebook's and Instagram's address ranges could coexist without a manual, host-by-host renumbering *(third-party)* [10].
+During the VPC move, AWS offered no way to share security groups or bridge private classic-EC2 and VPC networks, so they built **Neti**, a Python + **Zookeeper** "dynamic IP table manipulation daemon" that supplied the security-group behavior and gave every instance a single address regardless of which of the two networks it ran in *(third-party)* [11].
 
-Because Facebook's data centers ran a different, customized Linux configuration than Instagram's AWS hosts, the team also wrapped their existing provisioning tools — Chef and Fabric — inside **Linux Containers**, so those tools kept working unmodified instead of needing a from-scratch port *(third-party)* [10].
+Because Facebook's data centers ran a different, customized Linux configuration than Instagram's AWS hosts, the team also wrapped their existing provisioning tools — Chef and Fabric — inside **Linux Containers**, so those tools kept working unmodified instead of needing a from-scratch port *(third-party)* [11].
 
-All of this happened live: Instagram's user base grew through roughly 200 million during the migration, doubling over its course, with thousands of EC2 instances continuing to serve production traffic the entire time — which is exactly why a temporary bridging layer, rather than a single cutover, was the right shape for the problem (see the [migration deep dive](#the-2014-aws-to-facebook-migration-solving-an-ip-space-collision-without-downtime) below) *(third-party)* [10].
+All of this happened live: Instagram's user base grew through roughly 200 million during the migration, doubling over its course, with thousands of EC2 instances continuing to serve production traffic the entire time — which is exactly why a temporary bridging layer, rather than a single cutover, was the right shape for the problem (see the [migration deep dive](#the-2014-aws-to-facebook-migration-solving-an-ip-space-collision-without-downtime) below) *(third-party)* [11].
 
-The finished migration moved more than 20 billion photos, took about a year of planning plus a month of execution with a team that grew from 8 to 20 engineers, and left Instagram running on roughly a third fewer servers than before — Facebook's data centers reportedly ran about 38% more efficiently and 24% cheaper than the industry average at the time *(third-party)* [10][11].
+The finished migration moved more than 20 billion photos, took about a year of planning plus a month of execution, and left Instagram running on roughly a third fewer servers than before — Facebook's data centers reportedly ran about 38% more efficiently and 24% cheaper than the industry average at the time *(third-party)* [10][11].
 
 ### The ranking era (2016-2025)
 
@@ -196,7 +299,7 @@ With storage and infrastructure questions settled, the next decade of changes wa
 
 Instagram later disclosed real numbers behind that decision: under the old chronological order, users were missing about 70% of all posts in their feed, and roughly 50% of posts specifically from friends; after the switch to ranked order, Instagram reported that figure improved to around 90% of friends' posts seen *(third-party)* [16].
 
-The change was not universally welcomed — Instagram publicly acknowledged "backlash about confusing ordering" after the rollout, and made a deliberate choice not to ship a chronological toggle back into the product, on the stated grounds that it didn't want to add more complexity *(third-party)* [16].
+The change was not universally welcomed — TechCrunch reported "backlash about confusing ordering" after the rollout, and Instagram said in 2018 it wasn't considering a chronological option, on the stated grounds that it didn't want to add more complexity *(third-party)* [16].
 
 By 2018, Instagram had publicly named the specific signals behind that ranking *(third-party)* [16]:
 
@@ -219,7 +322,7 @@ That single ranking problem grew into a genuine platform: by 2023, Explore alone
 
 By 2025, the same funnel pattern had been replicated across Feed, Stories, Reels, comments, and notifications — more than 1,000 separate models in production — at which point the hard problem stopped being "build one more ranking model" and became "manage a thousand of them," answered with a shared Model Registry, an automated launch platform, and the SLICK SLO framework [6][8].
 
-Instagram's own head of product, Adam Mosseri, has since put a public face on a subset of those signals: statements compiled from his public comments in early 2025 describe watch time as the single most important cross-surface ranking signal, with "sends per reach" (a post shared into a DM) weighted several times heavier than a like when it comes to reaching people who don't already follow the account *(third-party, secondhand-compiled statements, not a primary Instagram engineering source)* [18].
+Instagram's own head of product, Adam Mosseri, has since put a public face on a subset of those signals: statements compiled from his public comments in early 2025 name watch time, likes per reach, and DM shares as the three most important ranking signals, with "sends per reach" (a post shared into a DM) reportedly weighted 3-5x heavier than a like when it comes to reaching people who don't already follow the account *(third-party, secondhand-compiled statements, not a primary Instagram engineering source)* [18].
 
 Underneath all of this, Cassandra kept scaling too: once clusters passed roughly 1,000 nodes, JVM garbage-collection pauses started dominating tail latency, which is what motivated Rocksandra — swapping in a RocksDB storage engine while keeping Cassandra's distributed-systems layer intact [3].
 
@@ -232,11 +335,11 @@ Underneath all of this, Cassandra kept scaling too: once clusters passed roughly
 | Feed order | Reverse-chronological | Ranked by a multi-stage funnel behind 1,000+ ML models *(third-party)* [6][16] |
 | Activity/feed data store | Redis (all in RAM) | Cassandra, running Instagram's RocksDB-backed Rocksandra storage engine [3][13] |
 | Media hosting | Amazon S3 + CloudFront | Facebook's own data centers, since the 2014 migration *(third-party)* [10][11] |
-| Networking | Classic Amazon EC2 IP space | Facebook's private data-center network — bridged during the 2014 cutover by Neti, a purpose-built IP-rewriting daemon, then Neti was retired *(third-party)* [10] |
+| Networking | Classic Amazon EC2 IP space | Facebook's private data-center network — reached via an interim move to Amazon VPC (with Neti, a purpose-built IP-table daemon, bridging classic EC2 and VPC) and Amazon Direct Connect *(third-party)* [11] |
 | Deployment | Manual, small team | Canary pipeline (Sauron + Jenkins + Fabric), 30-50 deploys/day [9] |
 | Model operations | None — one sort order, no models to manage | Model Registry (Configerator-backed) + automated launch platform + SLICK health monitoring across 1,000+ models [6] |
 
-Reading down that table, the pattern is the same one that shows up at every company on this kind of page: almost nothing was replaced because the original choice was wrong — a single Postgres box, Redis-in-RAM, and a plain reverse-chronological feed were all reasonable choices at the scale they were made. Each row on the right exists because the row on the left hit a specific, named number (25 writes/sec on one DB, a Redis RAM bill, a feed nobody could keep up with) that forced a replacement.
+Reading down that table, the pattern is the same one that shows up at every company on this kind of page: almost nothing was replaced because the original choice was wrong — a single Postgres box, Redis-in-RAM, and a plain reverse-chronological feed were all reasonable choices at the scale they were made. Each row on the right exists because the row on the left hit a specific, named number (25 writes/sec on one DB, Redis's everything-in-RAM limit, a feed nobody could keep up with) that forced a replacement.
 
 ## High-level design
 
@@ -265,8 +368,8 @@ Walking through a feed load:
 3. For a feed/Explore/Reels request, the monolith calls the **ranking service**, which pulls candidates and scores them using models pulled from a **model registry** and features from a **feature/embedding store** [6][7].
 4. Post and user metadata (captions, usernames, the follow graph) live in **sharded PostgreSQL**, addressed using the sharded ID scheme described below [1].
 5. High-write, high-fan-out data — the activity feed, likes, comments-as-events — lives in **Cassandra**, running Instagram's RocksDB-backed storage engine for predictable tail latency [3].
-6. A **cache tier** (Redis for hot data, Memcached for warm data) sits in front of both stores to absorb the read traffic a feed load generates [2].
-7. Uploads go through an **async task queue** (originally Gearman) so the user-facing upload request returns fast while **media processing workers** generate multiple image/video resolutions in the background and push them into **object storage**, from which the **CDN** serves them to everyone else [2].
+6. A **cache tier** (Redis and Memcached) sits in front of both stores to absorb the read traffic a feed load generates [2].
+7. Uploads go through an **async task queue** (originally Gearman) so the user-facing upload request returns fast while background workers handle the slow work; media lives in **object storage**, from which the **CDN** serves it to everyone else [2]. *(The "media processing workers" resize/transcode box is a reference-design assumption; [2] names cross-posting, notifications, and feed fan-out as the queued work.)*
 8. The same queue also drives **notification ranking**, which is its own ML-ranked surface, not a simple activity log [8].
 
 ## Low-level design
@@ -498,7 +601,7 @@ A model breaching its expected healthy range on either metric gets flagged autom
 
 The **automated launch platform** turns a new model rollout into a five-step pipeline: it takes in the model's offline performance test results, automatically collects live demand/traffic metrics, calculates the compute cost of running the new model at scale, executes a gradual upscale-while-shifting-traffic cycle between the old and new model (rather than a single cutover), and logs every step back into the Model Registry so the change is auditable later [6].
 
-Before this platform existed, engineers shifted traffic between model versions manually, in fixed 20% increments — a process the same team says the automated pipeline has cut by more than two engineer-days per launch, which is a large part of why launch velocity could grow from "a few" per week to 10+ per week [6].
+Before this platform existed, engineers shifted traffic between model versions manually, in increments of roughly 20% — a process the same team says the automated pipeline has cut by more than two engineer-days per launch, which is a large part of why launch velocity could grow from "a few" per week to 10+ per week [6].
 
 ```mermaid
 stateDiagram-v2
@@ -528,11 +631,11 @@ Each of those four dimensions carries its own configurable weight, so the penalt
 
 > **Why this matters:** this is a good real-world counter-example to "just train one bigger model" — Instagram's growth path was toward *more, smaller, specialized* models plus heavy platform investment in managing them, not one model that does everything [6]. It's also a reminder that "add a smarter model" isn't the only lever: notification ranking's diversity fix is a multiplicative penalty bolted onto an existing model, not a new model at all [8].
 
-Instagram frames the reason for staging it this way plainly: "in a world with infinite computational power and no latency requirements we could rank all candidates," but real systems don't have either, so a multi-stage funnel is what makes ranking a pool of billions affordable at all [7]. The problem statement they give is specific about the gap being bridged: selecting "hundreds of relevant items from a media pool of billions of items" [7].
+Instagram frames the reason for staging it this way plainly: "in a world with infinite computational power and no latency requirements we could rank all possible content," but real systems don't have either, so a multi-stage funnel is what makes ranking a pool of billions affordable at all [7]. The problem statement they give is specific about the gap being bridged: selecting "hundreds of relevant items from a media pool of billions of items" [7].
 
 **Worked example (illustrative funnel, following the stage counts in [7]):** picture a single Explore request starting from a candidate pool that's billions of posts wide. Retrieval — the Two-Tower model — narrows that down to thousands of candidates by comparing cached embeddings rather than running a heavy model per item. First-stage ranking narrows that pool of thousands down further, still using comparatively cheap features.
 
-Second-stage ranking, the heavier MTML model, produces the actual engagement predictions — P(click), P(like), P(see less) — for the roughly 100 best candidates that survive the first stage, combining them into one expected-value score. Only the survivors of *that* pass hit the final integrity/diversity rerank, which trims down to the roughly one hundred items actually presented to the user [7]. Each stage's entire job is to make the next, more expensive stage's problem small enough to afford [7].
+Second-stage ranking, the heavier MTML model, produces the actual engagement predictions — P(click), P(like), P(see less) — for the roughly 100 best candidates that survive the first stage, combining them into one expected-value score. Only the survivors of *that* pass hit the final integrity/diversity rerank before the page is returned [7]. Each stage's entire job is to make the next, more expensive stage's problem small enough to afford [7].
 
 One operational wrinkle the 2023 post is explicit about: running the heaviest MTML model for every user at the moment they open Explore would spike compute demand right at peak traffic hours. Instagram's answer is to precompute recommendations for some users ahead of time, during off-peak hours, specifically "to ensure the availability of our recommendations for every Explore user" even under peak load [7].
 
@@ -541,9 +644,9 @@ One operational wrinkle the 2023 post is explicit about: running the heaviest MT
 | Retrieval (Two-Tower) | Billions of posts -> thousands | Recall — don't discard anything plausibly relevant, cheaply |
 | First-stage ranking | Thousands of candidates | Cheap, fast filtering down to the shortlist |
 | Second-stage ranking (MTML) | ~100 best candidates | Precision — full engagement-probability prediction |
-| Final rerank | ~100 items shown to the user | Integrity filters, diversity rules |
+| Final rerank | Second-stage survivors (final count not published) | Integrity filters, diversity rules |
 
-**What it costs:** operational overhead. Going from "a few" launches per week to 10+ per week only became sustainable after the platform tooling existed; before that, each new model needed manual capacity planning and rollout in fixed 20% traffic increments.
+**What it costs:** operational overhead. Going from "a few" launches per week to 10+ per week only became sustainable after the platform tooling existed; before that, each new model needed manual capacity planning and rollout in roughly 20% traffic increments.
 
 The registry/tiering/calibration machinery itself is infrastructure that has to be built and maintained before it saves anyone time [6].
 
@@ -551,21 +654,21 @@ The registry/tiering/calibration machinery itself is infrastructure that has to 
 
 **What it is:** Apache Cassandra, a wide-column, LSM-tree-based distributed database, used at Instagram for write-heavy, high-fan-out data like the activity feed [3][13].
 
-**The problem it solved:** Instagram originally kept this kind of data in Redis, which is fast but keeps everything in RAM — as the dataset grew, that became a memory-bound cost problem. Cassandra's disk-backed model, plus built-in replication and horizontal scalability, was adopted instead, reportedly around a 75% cost reduction versus the Redis footprint it replaced *(third-party)* [13].
+**The problem it solved:** Instagram originally kept this kind of data in Redis, which is fast but keeps everything in RAM — as the dataset grew, that became a memory-bound cost problem. Cassandra's disk-backed model, plus built-in replication and horizontal scalability, was adopted instead, starting in 2012 [2][3].
 
-**How it works inside:** standard Cassandra writes go to an in-memory structure plus a commit log, then get flushed to disk as immutable sorted files, merged over time (an LSM tree) — good for write throughput, but Cassandra's original storage engine runs on the JVM, and at large scale JVM garbage collection became the problem: once Instagram's clusters grew past roughly 1,000 nodes, GC pauses were driving P99 read latency up to the 25-60ms range *(third-party)* [3][13].
+**How it works inside:** standard Cassandra writes go to an in-memory structure plus a commit log, then get flushed to disk as immutable sorted files, merged over time (an LSM tree) — good for write throughput, but Cassandra's original storage engine runs on the JVM, and JVM garbage collection became the problem: on one production cluster, P99 read latency swung between 25ms and 60ms, and GC was found to contribute a lot to those spikes [3].
 
-Instagram's fix was **Rocksandra** — keeping Cassandra's distributed-systems layer (replication, gossip, query language) but swapping its storage engine for RocksDB, a C++ key-value engine with no GC pauses. That meant designing an encoding layer to map Cassandra's richer data model onto RocksDB's simpler key-value interface, and reimplementing bulk-loading (`sstableloader`-equivalent) to stream into temporary SST files before loading into RocksDB [3].
+Instagram's fix was **Rocksandra** — keeping Cassandra's distributed-systems layer (replication, gossip, query language) but swapping its storage engine for RocksDB, a C++ key-value engine with no GC pauses. That meant designing an encoding layer to map Cassandra's richer data model onto RocksDB's simpler key-value interface, and re-implementing streaming (moving data between nodes when one joins or leaves) to write temp SST files and bulk-ingest them into RocksDB [3].
 
 > **Why this matters:** "swap the storage engine, keep the distributed systems layer" is a reusable move whenever a mature distributed database's *coordination* logic is fine but its *storage* layer has hit a wall — you don't have to replace the whole system [3].
 
-**Worked example (illustrative, following the numbers in [3]):** imagine a single read request landing on a Cassandra node at the moment the JVM decides it's time for a garbage-collection pause. On stock Cassandra, that request sits blocked behind the pause — this is exactly the kind of event that was pushing P99 latency up toward 60ms once clusters passed roughly 1,000 nodes, because at that scale *some* node is almost always mid-pause.
+**Worked example (illustrative, following the numbers in [3]):** imagine a single read request landing on a Cassandra node at the moment the JVM decides it's time for a garbage-collection pause. On stock Cassandra, that request sits blocked behind the pause — this is exactly the kind of event that was pushing P99 latency up toward 60ms, because in a large cluster *some* node is almost always mid-pause.
 
-Route that same request to a Rocksandra node instead, and there's no JVM heap for the storage layer to pause on — RocksDB is a C++ engine with no garbage collector — so the read only ever waits on real disk/network I/O. Multiply that difference across a fleet, and it's the mechanism behind the reported 60ms-to-20ms P99 improvement and the drop in GC-stalled reads from 2.5% to 0.3% [3].
+Route that same request to a Rocksandra node instead, and there's no JVM heap for the storage layer to pause on — RocksDB is a C++ engine with no garbage collector — so the read only ever waits on real disk/network I/O. Multiply that difference across a fleet, and it's the mechanism behind the reported 60ms-to-20ms P99 improvement and the drop in GC stall time from 2.5% to 0.3% of server runtime [3].
 
 **What it costs:** a year of engineering effort to build and validate before it shipped to production, plus taking on long-term maintenance of a forked storage engine rather than using Cassandra's engine as-is [3].
 
-The payoff was concrete: P99 read latency dropped from ~60ms to ~20ms, and the share of reads hitting a GC stall fell from 2.5% to 0.3% [3].
+The payoff was concrete: P99 read latency dropped from ~60ms to ~20ms, and the share of server runtime lost to GC stalls fell from 2.5% to 0.3% [3].
 
 ### Media storage and delivery
 
@@ -573,7 +676,7 @@ The payoff was concrete: P99 read latency dropped from ~60ms to ~20ms, and the s
 
 **The problem it solved:** photo/video bytes are large, immutable once uploaded, and read far more often than written — none of which describes what a relational database is good at. Keeping them out of Postgres/Cassandra entirely, and instead using purpose-built object storage plus a CDN, is what makes both the database tier and the read path fast [2].
 
-**How it works inside:** in Instagram's original (2012) design, the upload request itself only had to persist the raw bytes and enqueue a job — the actual work (generating multiple resolutions for different device sizes/connection speeds, plus cross-posting to other networks and notifying real-time subscribers) happened asynchronously via Gearman, a task-queue system, so the user-facing request stayed fast even though the "heavy lifting" didn't.
+**How it works inside:** in Instagram's original (2011) design, the upload request itself only had to persist the raw bytes and enqueue a job — the slow work (cross-posting to other networks and notifying real-time subscribers) happened asynchronously via Gearman, a task-queue system, so the user-facing request stayed fast even though the "heavy lifting" didn't.
 
 At the time, roughly 200 Python worker processes were consuming that queue continuously, and feed fan-out itself ran through the same queue — which is precisely what let posting feel just as responsive for a brand-new account as for one with many followers [2].
 
@@ -601,9 +704,9 @@ The async pipeline also means there's a brief window after upload where not ever
 
 **The problem it solved:** nothing, exactly — this is the interesting part. Instagram never had a forcing function that made it split into microservices; instead it invested in tooling that lets hundreds of engineers keep shipping into one codebase safely [4][9].
 
-**How it works inside:** commits deploy continuously — Instagram's canary pipeline pushes new code to a small subset of servers first (via **Sauron**, a release-tracking tool, plus **Jenkins** for test-result gating and **Fabric** for SSH-based rollout scripting), and only rolls out fleet-wide if the canary looks healthy; rollouts are announced automatically in chat, with authors of new commits notified by email/SMS if something breaks [9].
+**How it works inside:** commits deploy continuously — Instagram's canary pipeline pushes new code to a small subset of servers first (tracked in **Sauron**, a release-tracking tool, with **Jenkins** for test-result gating and Facebook's distributed SSH system doing the rollout, replacing earlier **Fabric** scripts), and only rolls out fleet-wide if the canary looks healthy; rollouts are announced automatically in chat, and authors of the commits going out also get an email and SMS [9].
 
-Schema changes are done with feature-toggled dual-read/dual-write code paths rather than one-shot migrations, so a bad migration can be turned off without a redeploy [9].
+Schema changes are done with dual-read/dual-write code paths rather than one-shot migrations, enabled incrementally, with writes to the old schema kept going for a while in case there's a problem [9].
 
 Because a codebase this large is hard for humans to review exhaustively, Instagram also built static-analysis tooling (its open-sourced `LibCST` library grew out of this work) to catch classes of bugs automatically across the whole monolith rather than relying purely on code review [4].
 
@@ -636,37 +739,37 @@ Instagram has specifically cited fixing a flaky test suite and a growing commit 
 
 **The problem it solved:** Facebook wanted Instagram running on the same hardware, tooling, and internal systems (ad serving, spam/abuse detection, and the rest of Facebook's infrastructure stack) as the rest of the company, rather than continuing to pay Amazon for infrastructure Facebook already had its own data centers for *(third-party)* [10]. That should have been a large but conceptually simple copy job.
 
-It wasn't, because **Facebook's own internal private IP address space directly overlapped with the IP address space Instagram's servers were already using inside classic Amazon EC2**, and classic EC2 networking had no built-in way to bridge or share security groups with Facebook's network to work around that overlap *(third-party)* [10].
+It wasn't, because **Facebook's own internal private IP address space directly overlapped with the IP address space Instagram's servers were already using inside classic Amazon EC2** *(third-party)* [11].
 
 **How it works inside:** the team split the problem into two migrations instead of one.
 
-First, they moved Instagram's entire EC2 footprint onto **Amazon VPC** — a network product with more flexible, configurable IP addressing than classic EC2 — purely to buy the addressing flexibility needed for the next step; the engineers who ran it (Rick Branson, Pedro Cahauati, and Nick Shortway) described it as the fastest VPC migration at that scale anyone had done, at roughly three weeks *(third-party)* [10].
+First, they moved Instagram's entire EC2 footprint onto **Amazon VPC** — a network product with more flexible, configurable IP addressing than classic EC2 — so its address space no longer conflicted with Facebook's private network; the engineers who ran it (Rick Branson, Pedro Cahauati, and Nick Shortway) described it as the fastest VPC migration at that scale ever, at roughly three weeks *(third-party)* [11].
 
-Second, to actually resolve the collision between Facebook's address space and Instagram's new VPC address space, they built **Neti** — a purpose-built daemon, written in Python and coordinated through **Zookeeper**, that dynamically rewrote IP tables on the fly so both address ranges could coexist on the same network without a manual, host-by-host renumbering *(third-party)* [10].
+Second, because AWS offered no way to share security groups or bridge private classic-EC2 and VPC networks while thousands of instances sat on both sides, they built **Neti** — a Python + **Zookeeper** "dynamic IP table manipulation daemon" that supplied the security-group behavior and gave every instance a single address regardless of which network it ran in; the stack then crossed into Facebook's data centers over **Amazon Direct Connect** *(third-party)* [11].
 
-Separately, because Facebook's data centers ran a different, customized Linux configuration than Instagram's AWS hosts, the team wrapped their existing provisioning tools — Chef for configuration management and Fabric for SSH-based rollout scripting, the same Fabric that also drives the canary deploy pipeline described in the [Django monolith deep dive](#the-django-monolith-at-scale) above — inside **Linux Containers**, so those tools kept working unmodified inside Facebook's environment instead of needing a from-scratch port *(third-party)* [10].
+Separately, because Facebook's data centers ran a different, customized Linux configuration than Instagram's AWS hosts, the team wrapped their existing provisioning tools — Chef for configuration management and Fabric for SSH-based rollout scripting, the same Fabric that also drives the canary deploy pipeline described in the [Django monolith deep dive](#the-django-monolith-at-scale) above — inside **Linux Containers**, so those tools kept working unmodified inside Facebook's environment instead of needing a from-scratch port *(third-party)* [11].
 
-All of this happened live: Instagram's user base was growing through roughly 200 million during the migration, doubling over its course, with thousands of EC2 instances continuing to serve production traffic throughout *(third-party)* [10].
+All of this happened live: Instagram's user base was growing through roughly 200 million during the migration, doubling over its course, with thousands of EC2 instances continuing to serve production traffic throughout *(third-party)* [11].
 
 ```mermaid
 flowchart TD
   A["Instagram running on classic EC2<br/>(IP space overlaps Facebook's internal network)"] --> B["Step 1: migrate onto AWS VPC<br/>(~3 weeks; buys flexible addressing)"]
-  B --> C["Step 2: deploy Neti<br/>(Python + Zookeeper daemon,<br/>dynamic IP table rewriting)"]
-  C --> D["Neti bridges Facebook's private<br/>IP space and Instagram's VPC space"]
+  B --> C["During the VPC move: Neti<br/>(Python + Zookeeper daemon,<br/>dynamic IP table rewriting)"]
+  C --> D["Neti bridges classic-EC2 and VPC instances;<br/>Direct Connect links VPC to Facebook"]
   D --> E["Chef + Fabric provisioning tools<br/>wrapped in Linux Containers<br/>to run unmodified on FB's Linux config"]
   E --> F["Gradual cutover of 20B+ photos<br/>and thousands of instances,<br/>zero scheduled downtime"]
   F --> G["Result: ~1/3 fewer servers;<br/>FB data centers ~38% more efficient,<br/>~24% cheaper than average"]
 ```
 
-> **Why this matters:** this is a reusable pattern any time two networks or organizations need to merge infrastructure without downtime: instead of one big-bang cutover, build a temporary compatibility layer that lets both the old and new environments coexist — Neti's dynamic IP rewriting, in this case — do the actual cutover gradually behind that layer, and only retire the compatibility layer once nothing depends on it anymore *(third-party)* [10].
+> **Why this matters:** this is a reusable pattern any time two networks or organizations need to merge infrastructure without downtime: instead of one big-bang cutover, build a temporary compatibility layer that lets both the old and new environments coexist — Neti's dynamic IP rewriting between classic EC2 and VPC, in this case — do the actual cutover gradually behind that layer, and only retire the compatibility layer once nothing depends on it anymore *(third-party)* [11].
 
 **Worked example (following the process in [10]):** picture one single production host mid-migration. Before anything changes, it holds an EC2 address that would collide with a real Facebook-internal address if the two networks were simply plugged together. The VPC migration doesn't fix that collision by itself — it just moves the host onto a network product flexible enough that a fix becomes *possible*.
 
-Neti is what actually makes the host reachable from both sides at once: it watches for the host and rewrites local IP tables so traffic addressed to it resolves correctly whether it's coming from Instagram's own fleet or from Facebook's internal network, without anyone hand-editing a routing table. Multiply that one host by thousands, spread over weeks, and a photo keeps loading normally for end users at every point in the process — no single request path ever depended on the whole fleet having moved at once.
+Neti is what keeps the host reachable while the fleet is split: it rewrites local IP tables so the host keeps a single address whether it (or the peer calling it) is still on classic EC2 or already on VPC, without anyone hand-editing a routing table. Multiply that one host by thousands, spread over weeks, and a photo keeps loading normally for end users at every point in the process — no single request path ever depended on the whole fleet having moved at once.
 
-Unlike Facebook's earlier, smaller acquisition-migration playbook (its 2010 FriendFeed acquisition, folded in by simply turning the service off for the move), Instagram was already too large and still growing too fast for a maintenance window to be an acceptable answer *(third-party)* [10][11].
+Unlike Facebook's earlier, smaller acquisition-migration playbook (its FriendFeed acquisition, folded in by shutting the service down before moving its data), Instagram was already too large and still growing too fast for a maintenance window to be an acceptable answer *(third-party)* [10][11].
 
-**What it costs:** a one-off piece of bridging infrastructure (Neti) that had no purpose once the migration finished, built and maintained by a team that grew from 8 to 20 engineers over roughly a year of planning plus a month of execution — real headcount and calendar time spent on a project that, from a user's perspective, was supposed to be invisible [10][11].
+**What it costs:** a one-off piece of bridging infrastructure (Neti) that had no purpose once the migration finished, built and maintained over roughly a year of planning plus a month of execution — real headcount and calendar time spent on a project that, from a user's perspective, was supposed to be invisible [10][11].
 
 The payoff was concrete on the other side: about a third fewer servers than before, running in data centers reported to be about 38% more efficient and 24% cheaper than the industry average *(third-party)* [11].
 
@@ -676,9 +779,9 @@ The payoff was concrete on the other side: about a third fewer servers than befo
 - **A network partition between shards:** this is where the sharded-ID design pays off structurally. Because each logical shard mints its own IDs entirely locally — no cross-shard call, no check-in with a coordinator — a partition that isolates shard 42 from every other shard in the fleet changes nothing about shard 42's ability to keep accepting writes and generating valid, unique IDs. Compare that to a design with one central ID-generation service: a partition that cuts a region off from that service would stall writes everywhere in that region, all at once [1].
 - **A hot key / a post goes viral:** a single extremely popular post means every one of its followers' feed reads and every like/comment write pile onto the same handful of rows, all at once. The general Cassandra/cache pattern for this class of problem — replicate the hot row further, cache it aggressively at the edge, and coalesce many identical concurrent reads into a single upstream fetch instead of hitting the database once per reader — is standard practice, but Instagram-specific handling for viral posts isn't detailed in public sources. *(reference design.)*
 - **A Cassandra node fails:** Cassandra (the base system Instagram builds Rocksandra on top of) replicates each piece of data to multiple nodes and uses hinted handoff — writes meant for a node that's temporarily down are held elsewhere and replayed to it once it recovers — so a single node failure neither loses data nor blocks writes, by design of the underlying Dynamo-style architecture Cassandra is built on *(third-party, general Cassandra behavior, not Instagram-specific)* [17].
-- **Two networks need to merge, but their IP address spaces collide:** this already happened to Instagram for real, in 2014 — Facebook's internal IP space directly overlapped with Instagram's EC2 IP space, and neither classic EC2 nor Amazon VPC had a built-in way to bridge that. The fix wasn't a single bigger network change; it was a temporary compatibility layer (the Neti daemon, dynamically rewriting IP tables) that let both address spaces coexist just long enough for a gradual cutover, then got retired once nothing needed it anymore *(third-party)* [10].
+- **Two networks need to merge, but their IP address spaces collide:** this already happened to Instagram for real, in 2014 — Facebook's internal IP space directly overlapped with Instagram's EC2 IP space. The fix wasn't a single bigger network change: an interim move to Amazon VPC sidestepped the overlap, a temporary compatibility layer (the Neti daemon, dynamically rewriting IP tables) let classic-EC2 and VPC instances coexist during that move, and Amazon Direct Connect carried the final hop into Facebook *(third-party)* [11].
 - **A whole data center goes down:** Instagram's 2014 move off AWS was itself partly about gaining this kind of resilience — running on Facebook's own multi-data-center infrastructure rather than a single cloud provider's region — but the public sources describing that migration focus on the migration itself (20 billion+ photos moved, roughly a third fewer servers needed afterward) rather than a documented failover runbook for a full data-center loss. *(reference design; the migration itself is confirmed [10][11], the failover behavior is inferred.)*
-- **A bad deploy ships to the monolith:** this is exactly what the canary pipeline exists to catch. Sauron pushes new code to a small subset of servers first; Jenkins-gated test results and error signals determine whether that canary looks healthy; only a healthy canary gets promoted fleet-wide via Fabric-scripted rollout, and the commit's author gets paged by chat/email/SMS if something looks wrong. A bad deploy is caught and rolled back on a small slice of traffic before most users would ever see it [9].
+- **A bad deploy ships to the monolith:** this is exactly what the canary pipeline exists to catch. Sauron pushes new code to a small subset of servers first; Jenkins-gated test results and error signals determine whether that canary looks healthy; only a healthy canary gets promoted fleet-wide, and commit authors are told via chat, email, and SMS when their changes go out. A bad deploy is caught and rolled back on a small slice of traffic before most users would ever see it [9].
 - **One of 1,000+ ranking models regresses after a launch:** Instagram tracks model stability directly — via **calibration** (the ratio of predicted to empirical click-through rate; a healthy model sits near 1) and **normalized entropy** (how well the model still separates action from inaction; a value near 1 means it has degraded to guessing) — and a model that breaches its expected healthy range on either metric gets flagged automatically [6].
   Because the automated launch platform ramps every new model up gradually while shifting traffic rather than flipping it on for 100% of requests at once, a regression caught by those metrics during a partial rollout only ever affects a bounded slice of traffic, not the whole ranked surface [6].
 - **A notification model starts spamming the same few people:** an engagement-optimized ranking model, left alone, tends to over-favor whichever accounts or notification types a user already engages with most — technically "relevant," but repetitive. Instagram's fix doesn't retrain the model; it multiplies the existing relevance score by a diversity-demotion factor (`Score(c) = R(c) * D(c)`) that shrinks as a candidate looks too similar — by author, content, type, or surface — to what was already sent recently, catching the repetition pattern without touching the underlying ranking model at all [8].
@@ -691,13 +794,13 @@ The payoff was concrete on the other side: about a third fewer servers than befo
 |---|---|---|
 | Custom PL/pgSQL sharded ID scheme instead of a separate ID-generation service (like Snowflake) | Reuses PostgreSQL they already ran; avoids operating a whole new distributed service | Hard cap of 1,024 IDs per shard per millisecond; depends on reasonably synced shard clocks [1] |
 | Stay a Django monolith instead of splitting into microservices | Faster iteration for a fast-growing engineering team; avoids premature network-call complexity | Requires heavy investment in canary deploys, test-suite reliability, and static analysis to stay shippable [4][9] |
-| Cassandra for feed/activity data instead of an all-RAM store (Redis) | Fits write-heavy, high-fan-out access patterns; cut cost roughly 75% versus the Redis footprint it replaced | Its JVM-based storage engine hit a GC-driven latency wall at 1,000+ nodes, forcing the Rocksandra rewrite *(third-party)* [3][13] |
+| Cassandra for feed/activity data instead of an all-RAM store (Redis) | Fits write-heavy, high-fan-out access patterns without needing everything in memory | Its JVM-based storage engine hit a GC-driven tail-latency wall, prompting the Rocksandra rewrite [3] |
 | Multi-resolution image pipeline + CDN, media bytes never touch the app database | Saves bandwidth/load time on slow connections; keeps the database tier fast by keeping large blobs out of it | Extra storage for multiple renditions per photo; a short async delay before every resolution is ready [2] |
 | Ranking funnel (retrieval -> early -> late -> rerank) instead of one model scoring everything | Only spends heavy compute on the small shortlist that survives cheaper earlier stages | More moving parts (1,000+ models by 2025), which needed dedicated platform tooling to manage [6][7] |
 | Account-level embeddings (ig2vec) instead of a content taxonomy, for Explore candidate generation | Sidesteps having to define and maintain labels for every possible niche interest community | Similarity is only as good as the embedding; a brand-new account with no engagement history has nothing to embed against [19] |
 | Layer a diversity-demotion multiplier on top of the existing notification model instead of retraining it | Cheaper fix for a real, narrow problem (repetitive notifications); ships without touching the underlying model | Adds a second scoring pass and per-dimension weights that themselves need tuning and monitoring [8] |
 | Precompute some users' Explore recommendations off-peak instead of scoring everyone at request time | Keeps the heaviest ranking model affordable during peak traffic | Precomputed recommendations can be slightly stale by the time they're actually served [7] |
-| Migrate through a temporary compatibility layer (AWS VPC, then the Neti daemon) instead of one big-bang cutover | Let 20 billion+ photos and thousands of live instances move with no scheduled downtime | Required building — and later retiring — a one-off bridging tool that only ever existed to serve this one migration *(third-party)* [10] |
+| Migrate through a temporary compatibility layer (AWS VPC bridged by the Neti daemon, then Direct Connect) instead of one big-bang cutover | Let 20 billion+ photos and thousands of live instances move with no scheduled downtime | Required building — and later retiring — a one-off bridging tool that only ever existed to serve this one migration *(third-party)* [10] |
 
 ## Interview takeaways
 
@@ -705,19 +808,21 @@ The payoff was concrete on the other side: about a third fewer servers than befo
 - **"When should you NOT use microservices?"** -> Instagram is the standard counter-example: a monolith can serve billions of users if you invest in deployment tooling (canary, static analysis) instead of network boundaries [4][9].
 - **"How do you rank an unbounded candidate pool in real time?"** -> narrow the field in stages (retrieval -> lightweight ranking -> heavy ranking -> rerank), spending the most expensive model on the fewest candidates [7].
 - **"How do you keep media out of your hot path?"** -> store only a pointer in the database; let a CDN and object storage carry the actual bytes, and process resolutions asynchronously off the upload request [2].
-- **"How do you pick a database for write-heavy social data?"** -> Cassandra's LSM-tree, disk-backed model was a deliberate trade against an all-RAM store once cost became the constraint, not raw performance alone [13].
+- **"How do you pick a database for write-heavy social data?"** -> Cassandra's LSM-tree, disk-backed model was a deliberate trade against an all-RAM store (Redis) once the data no longer fit comfortably in memory [2][3].
 - **"What do you do when a mature system's storage layer, not its distributed-systems layer, becomes the bottleneck?"** -> swap only the storage engine (Rocksandra), keep the coordination logic that already works [3].
 - **"How do you keep a system resilient to partial failure?"** -> design so each unit of the system (a shard, a Cassandra replica) can keep operating independently without a live connection to the rest of the fleet [1][17].
-- **"How do you migrate a live system between two environments with incompatible networking, without downtime?"** -> add a temporary compatibility layer that lets both environments coexist (Instagram's Neti daemon bridging Facebook's and EC2's colliding IP spaces), cut over gradually behind it, then retire the layer — not one big-bang cutover [10].
+- **"How do you migrate a live system between two environments with incompatible networking, without downtime?"** -> add a temporary compatibility layer that lets both environments coexist (Instagram's interim VPC move, with the Neti daemon bridging classic EC2 and VPC, to get clear of Facebook's colliding IP space), cut over gradually behind it, then retire the layer — not one big-bang cutover [11].
 - **"How do you keep 1,000+ ML models in production from silently degrading?"** -> track calibration and normalized entropy per model automatically, and gate every rollout through gradual traffic-shifting instead of trusting a human to notice a dashboard [6].
 - **"How do you fix a ranking model that's technically accurate but feels repetitive?"** -> layer a multiplicative diversity penalty on top of the existing model's score instead of retraining it from scratch — Instagram's notification ranking does exactly this [8].
 - **"How do you find 'similar' items when there's no clean taxonomy to sort them into?"** -> learn embeddings from co-engagement patterns (Instagram's ig2vec, modeled on word2vec) instead of hand-built categories, then do a nearest-neighbor search over those embeddings [19].
 
 ## Glossary
 
+New to these terms? The [concepts](../concepts/README.md) folder explains the core ideas in depth.
+
 - **Django**: a Python web framework that handles routing HTTP requests to code, talking to a database, and rendering responses — Instagram's entire backend is one large Django application.
 - **Monolith**: one codebase and one deployable application that handles many different kinds of requests, as opposed to splitting those responsibilities into many separately-deployed services (microservices).
-- **Sharding**: splitting one big database into smaller pieces (shards) by some key, so each machine only has to hold and serve part of the data.
+- **[Sharding](../concepts/sharding.md)**: splitting one big database into smaller pieces (shards) by some key, so each machine only has to hold and serve part of the data.
 - **Logical shard vs. physical shard**: a logical shard is a fixed, addressable partition of data (a Postgres schema, in Instagram's case); many logical shards can live on one physical database server, and can be moved to a different physical server later without changing any IDs.
 - **PL/pgSQL**: PostgreSQL's built-in procedural language for writing functions that run inside the database itself, rather than in application code.
 - **Snowflake (ID scheme)**: Twitter's approach to generating unique, sortable IDs using a dedicated service; Instagram's scheme is conceptually similar but built into PostgreSQL instead of a separate service.
@@ -726,9 +831,9 @@ The payoff was concrete on the other side: about a third fewer servers than befo
 - **RocksDB**: an embeddable key-value storage engine written in C++, with no garbage collector, used as a drop-in replacement storage layer under Cassandra in Instagram's "Rocksandra."
 - **Garbage collection (GC) pause**: a stop-the-world moment where a language runtime (like the JVM) pauses a program to reclaim unused memory — under heavy load this can spike request latency unpredictably.
 - **P99 latency**: the response time that 99% of requests are faster than; a common way to describe "how slow are the worst-but-not-rarest requests," as opposed to the average.
-- **CDN (Content Delivery Network)**: a network of servers spread across many locations that cache and serve content (like images) from a location physically close to the user, instead of every request traveling back to one origin server.
+- **[CDN (Content Delivery Network)](../concepts/cdn.md)**: a network of servers spread across many locations that cache and serve content (like images) from a location physically close to the user, instead of every request traveling back to one origin server.
 - **Object storage**: a storage system built to hold large, immutable blobs (like photos/videos) addressed by a key, rather than as rows in a database or files in a traditional filesystem.
-- **Task queue**: a system (Gearman, in Instagram's original design) that lets a request hand off slow work to be done asynchronously in the background, so the request itself can return quickly.
+- **[Task queue](../concepts/message-queues-and-logs.md)**: a system (Gearman, in Instagram's original design) that lets a request hand off slow work to be done asynchronously in the background, so the request itself can return quickly.
 - **Canary deployment**: rolling out a new version of code to a small subset of servers first, checking that it behaves correctly, and only then rolling it out everywhere.
 - **Two-Tower model**: a neural network architecture with two separate halves — one encodes the user, one encodes the item — whose outputs can each be computed and cached independently, making large-scale retrieval much cheaper.
 - **MTML (Multi-Task Multi-Label) model**: a single model trained to predict several different outcomes at once (e.g., probability of a click, a like, and a "see less") instead of needing a separate model per outcome.
@@ -746,14 +851,14 @@ The payoff was concrete on the other side: about a third fewer servers than befo
 - **Zookeeper**: a coordination service distributed systems use to agree on shared state (like configuration or leader election) across many machines.
 - **Linux Containers (LXC)**: a way to package an application with its own isolated filesystem and process environment so it runs consistently regardless of the underlying host's configuration — a precursor to tools like Docker.
 - **Hinted handoff**: a technique where, if a database replica is temporarily unreachable, the writes meant for it are held elsewhere and replayed to it once it comes back, instead of being lost.
-- **Replication factor**: how many copies of each piece of data a distributed database keeps, so losing one copy (one node) doesn't lose the data.
-- **Neti**: Instagram's purpose-built daemon for the 2014 migration, which rewrote IP tables dynamically so Facebook's and Instagram's colliding address spaces could coexist during the cutover.
+- **[Replication factor](../concepts/replication.md)**: how many copies of each piece of data a distributed database keeps, so losing one copy (one node) doesn't lose the data.
+- **Neti**: Instagram's purpose-built daemon for the 2014 migration, which rewrote IP tables dynamically so instances on classic EC2 and on Amazon VPC could talk to each other during the interim VPC move.
 - **Seed accounts**: the accounts a user has already engaged with, used as the starting point for finding more accounts (and their posts) that a recommendation system thinks the user will also like.
 
 ## Sources
 
 1. [Sharding & IDs at Instagram — Instagram Engineering](https://medium.com/instagram-engineering/sharding-ids-at-instagram-1cf5a71e5a5c)
-2. [What Powers Instagram: Hundreds of Instances, Dozens of Technologies — Instagram Engineering, 2012](https://medium.com/instagram-engineering/what-powers-instagram-hundreds-of-instances-dozens-of-technologies-adf2e22da2ad)
+2. [What Powers Instagram: Hundreds of Instances, Dozens of Technologies — Instagram Engineering, Dec 2011](https://medium.com/instagram-engineering/what-powers-instagram-hundreds-of-instances-dozens-of-technologies-adf2e22da2ad)
 3. [Open-sourcing a 10x reduction in Apache Cassandra tail latency — Instagram Engineering](https://medium.com/instagram-engineering/open-sourcing-a-10x-reduction-in-apache-cassandra-tail-latency-d64f86b43589)
 4. [Static Analysis at Scale: An Instagram Story — Instagram Engineering](https://medium.com/instagram-engineering/static-analysis-at-scale-an-instagram-story-8f498ab71a0c)
 5. [Lessons Learned at Instagram Stories and Feed Machine Learning — Instagram Engineering](https://medium.com/instagram-engineering/lessons-learned-at-instagram-stories-and-feed-machine-learning-54f3aaa09e56)

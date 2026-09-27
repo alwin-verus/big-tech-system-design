@@ -25,8 +25,8 @@ flowchart LR
 
 | Metric | Number | Source |
 |---|---|---|
-| Paid memberships | ~341.5M (Q1 2026) | [Q1 2026 Shareholder Letter](https://s22.q4cdn.com/959853165/files/doc_financials/2026/q1/FINAL-Q1-26-Shareholder-Letter.pdf) |
-| Share of global downstream internet traffic | ~15% (2023, Sandvine) | [AppLogic Networks / Sandvine](https://www.applogicnetworks.com/inthenews/netflix-is-responsible-for-15-of-global-internet-traffic-consumption) |
+| Paid memberships | ~341.5M (Q1 2026) (unverified — letter states no count) | [Q1 2026 Shareholder Letter](https://s22.q4cdn.com/959853165/files/doc_financials/2026/q1/FINAL-Q1-26-Shareholder-Letter.pdf) |
+| Share of global internet traffic | ~15% (2022 data, Sandvine report Jan 2023) | [AppLogic Networks / Sandvine](https://www.applogicnetworks.com/inthenews/netflix-is-responsible-for-15-of-global-internet-traffic-consumption) |
 | Open Connect footprint | 8,000+ appliances, 1,000+ ISP partners, 50+ internet exchange points | [Wikipedia: Open Connect](https://en.wikipedia.org/wiki/Open_Connect) |
 | Storage Appliance specs | up to 120TB storage, ~200Gbps, ~400W | [Netflix Open Connect appliances](https://openconnect.netflix.com/en/appliances/) |
 | Traffic delivered via direct ISP connections | ~95% globally (2018) | [APNIC blog](https://blog.apnic.net/2018/06/20/netflix-content-distribution-through-open-connect/) |
@@ -35,7 +35,7 @@ flowchart LR
 
 ## Signature ideas
 
-- **Open Connect (own CDN)** — physical appliances racked free inside ISPs, proactively filled overnight so most requests never leave the ISP's own network.
+- **Open Connect (own CDN)** — physical appliances racked free inside ISPs, proactively filled ahead of demand so most requests never leave the ISP's own network.
 - **Control plane / data plane split** — AWS decides "can and what you can watch"; Open Connect just moves bytes, so a region loss barely touches streams already playing.
 - **Per-title, then shot-based, encoding** — tailor the bitrate ladder to each title's, then each individual shot's, actual visual complexity instead of one fixed ladder for the catalog.
 - **PlayAPI prioritized load shedding** — under overload, a real user-initiated play request beats a speculative prefetch guess.
@@ -63,7 +63,7 @@ flowchart LR
 
 ## Gotchas
 
-- Don't call Open Connect "just a CDN" — the defining trait is proactive, forecast-based overnight fill, not reactive caching on request.
+- Don't call Open Connect "just a CDN" — the defining trait is proactive, forecast-based prepositioning, not reactive caching on request.
 - The exact steering weighting (proximity vs. load vs. content availability) isn't publicly documented — don't state a formula as confirmed.
 - Chaos Kong tests the AWS control plane's region-loss recovery; Open Connect (already-playing streams) is largely insulated from a region loss already — don't conflate the two.
 - "~95% of traffic via direct ISP connections" is a 2018 figure — don't present it as today's exact number.
