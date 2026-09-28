@@ -2,6 +2,8 @@
 
 Plain-English explanations of the recurring building blocks behind the [company deep dives](../companies/) in this repo. Each page explains the idea like you're five, then goes deeper: how it works, when to use which variant, where the companies here actually use it, common mistakes, and interview questions.
 
+New to the basics underneath these? The companion glossary has beginner deep dives on [API styles](https://github.com/alwintwk/dev-knowledge/blob/main/topics/api-styles.md), [authentication and authorization](https://github.com/alwintwk/dev-knowledge/blob/main/topics/auth.md), and [databases](https://github.com/alwintwk/dev-knowledge/blob/main/topics/databases.md).
+
 ## Storing and finding data
 
 - [Caching](caching.md) — keeping a copy of data somewhere faster to reach than where it really lives.
